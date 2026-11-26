@@ -4,8 +4,8 @@
 
 ## إعداد الخدمة
 
-1. أنشئ **Web Service** للمستودع الخاص `wahm8576-glitch/TikWahm-Bot` على الفرع `main`.
-2. اترك **Root Directory** فارغًا لأن ملفات البوت في جذر المستودع، واستخدم Docker واضبط مسار فحص الصحة على `/health`.
+1. أنشئ **Web Service** للمستودع `wahm8576-glitch/TikWahm-Bot` على الفرع `main`. عند الربط برابط عام دون موصل Git، يجب بدء عمليات النشر المستقبلية يدويًا من Render.
+2. اضبط **Root Directory** على `tikwahm-bot`، واستخدم Docker واضبط مسار فحص الصحة على `/health`.
 3. في Render، اضبط `BOT_TOKEN` على توكن البوت، وأضف `TIKWAHM_PROXY_DASHBOARD_PASSWORD` كسر للوحة الإدارة و`TIKWAHM_PROXY_LIST_B64` كمتغير سري (Base64 لمحتوى قائمة البروكسي بصيغة UTF-8). لا تحفظ القيم السرية داخل المستودع.
 4. عند اكتمال النشر، افتح صفحة الخدمة، ثم أرسل `/start` إلى البوت.
 
