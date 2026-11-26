@@ -8,23 +8,17 @@ import html
 import json
 import os
 import re
-import secrets
 import shutil
 import time
-import urllib.request
-from collections import OrderedDict
 from urllib.parse import quote, urlparse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
-import firebase_admin
-from firebase_admin import credentials as firebase_credentials, firestore
-from google.api_core.exceptions import AlreadyExists
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 import uvicorn
 
-from telebot import types
+from telebot import asyncio_helper, types
 from telebot.async_telebot import AsyncTeleBot
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -41,17 +35,14 @@ TIKIP_API_URL = "https://shinyfrydgdghfdgdgmouse-a6de.issam1996kech.workers.dev/
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
-SOURCE_ATTEMPT_TIMEOUT_SECONDS = 15
-SOURCE_TIMEOUT_MILLISECONDS = SOURCE_ATTEMPT_TIMEOUT_SECONDS * 1_000
+SOURCE_TIMEOUT_MILLISECONDS = CACHE_TTL_SECONDS * 1_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
+LOADING_GIF_PATH = os.path.join(os.path.dirname(__file__), "tikwahm_loading.gif")
 PROGRESS_MEDIA_ID = "tikwahm_loading"
-# Alternate compact native emoji so the loader remains inline with the title.
-PROGRESS_FRAMES = ("⏳", "⌛")
+PROGRESS_ATTACHMENT_NAME = "loading_animation"
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
-_SEEN_WEBHOOK_UPDATE_IDS = OrderedDict()
-_WEBHOOK_UPDATE_ID_CACHE_LIMIT = 4096
 _BROWSER_SEMAPHORE = asyncio.Semaphore(1)
 
 FIELD_LABELS = {
@@ -540,270 +531,9 @@ def _load_proxy_pool(path: str):
     return proxies
 
 
-PROXY_DASHBOARD_FILE = os.environ.get(
-    "TIKWAHM_PROXY_DASHBOARD_FILE",
-    os.path.join(os.path.dirname(__file__), "proxy_dashboard.json"),
-).strip()
-
-FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
-_FIRESTORE_PROXY_DOCUMENT = None
-_FIRESTORE_CLIENT = None
-_FIRESTORE_PROXY_VERSION = 0
-if FIREBASE_SERVICE_ACCOUNT_JSON:
-    try:
-        _firebase_service_account = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
-        _firebase_project_id = _firebase_service_account.get("project_id")
-        if not isinstance(_firebase_service_account, dict) or not _firebase_project_id:
-            raise ValueError("missing project_id")
-        _firebase_app = firebase_admin.initialize_app(
-            firebase_credentials.Certificate(_firebase_service_account),
-            {"projectId": _firebase_project_id},
-            name="tikwahm_proxy_dashboard",
-        )
-        _FIRESTORE_CLIENT = firestore.client(app=_firebase_app)
-        _FIRESTORE_PROXY_DOCUMENT = _FIRESTORE_CLIENT.collection("private_config").document("proxy_dashboard")
-    except Exception:
-        raise RuntimeError(
-            "تعذر تهيئة Firebase. تحقق من قيمة FIREBASE_SERVICE_ACCOUNT_JSON وصلاحية حساب الخدمة."
-        ) from None
-
-
-def _parse_proxy_source_line(raw_line: str):
-    line = raw_line.strip()
-    enabled = True
-    if line.casefold().startswith("# disabled:"):
-        enabled = False
-        line = line.split(":", 1)[1].strip()
-    elif not line or line.startswith("#"):
-        return None
-    parts = line.split(":", 3)
-    if len(parts) != 4:
-        return None
-    host, port, username, password = parts
-    if (
-        not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host)
-        or ".." in host or not port.isdigit() or not username or not password
-        or any(char in username + password for char in "\r\n\x00")
-    ):
-        return None
-    port_number = int(port)
-    if not 1 <= port_number <= 65535:
-        return None
-    return {
-        "id": secrets.token_urlsafe(12),
-        "host": host.rstrip("."),
-        "port": port_number,
-        "username": username,
-        "password": password,
-        "enabled": enabled,
-    }
-
-
-def _load_proxy_admin_entries(path: str):
-    try:
-        encoded = os.environ.get("TIKWAHM_PROXY_LIST_B64", "").strip()
-        if encoded:
-            content = base64.b64decode(encoded, validate=True).decode("utf-8")
-        else:
-            with open(path, "r", encoding="utf-8") as proxy_file:
-                content = proxy_file.read()
-    except (OSError, ValueError, UnicodeError):
-        return []
-    entries = []
-    for raw_line in content.splitlines():
-        parsed = _parse_proxy_source_line(raw_line)
-        if parsed is not None:
-            entries.append(parsed)
-    return entries
-
-
-def _normalize_proxy_dashboard_entries(entries):
-    if not isinstance(entries, list):
-        return None
-    loaded = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            return None
-        parsed = _parse_proxy_source_line(
-            f"{entry.get('host', '')}:{entry.get('port', '')}:"
-            f"{entry.get('username', '')}:{entry.get('password', '')}"
-        )
-        if parsed is None:
-            return None
-        proxy_id = str(entry.get("id", ""))
-        if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", proxy_id):
-            proxy_id = secrets.token_urlsafe(12)
-        parsed["id"] = proxy_id
-        parsed["enabled"] = bool(entry.get("enabled", True))
-        loaded.append(parsed)
-    return loaded
-
-
-def _load_proxy_dashboard_state():
-    try:
-        with open(PROXY_DASHBOARD_FILE, "r", encoding="utf-8") as state_file:
-            payload = json.load(state_file)
-        entries = payload.get("proxies") if isinstance(payload, dict) else None
-        return _normalize_proxy_dashboard_entries(entries)
-    except (OSError, ValueError, UnicodeError, TypeError):
-        return None
-
-
-def _proxy_payload_version(payload):
-    version = payload.get("version") if isinstance(payload, dict) else None
-    return version if isinstance(version, int) and not isinstance(version, bool) and version >= 1 else 1
-
-
-_PROXY_ADMIN_ENTRIES = (
-    _load_proxy_admin_entries(PROXY_LIST_PATH)
-    if _FIRESTORE_PROXY_DOCUMENT is not None and os.environ.get("TIKWAHM_PROXY_LIST_B64", "").strip()
-    else _load_proxy_dashboard_state()
-)
-if _PROXY_ADMIN_ENTRIES is None:
-    _PROXY_ADMIN_ENTRIES = _load_proxy_admin_entries(PROXY_LIST_PATH)
-_PROXY_POOL = [dict(proxy) for proxy in _PROXY_ADMIN_ENTRIES if proxy.get("enabled", True)]
+_PROXY_POOL = _load_proxy_pool(PROXY_LIST_PATH)
 _ACTIVE_PROXY_INDEX = 0
 _PROXY_LOCK = asyncio.Lock()
-
-
-async def _save_proxy_admin_entries(entries):
-    """Persist credentials remotely when configured, then refresh the live pool."""
-    global _PROXY_ADMIN_ENTRIES, _PROXY_POOL, _ACTIVE_PROXY_INDEX, _FIRESTORE_PROXY_VERSION
-    payload = {"version": _FIRESTORE_PROXY_VERSION or 1, "saved_at": int(time.time()), "proxies": entries}
-    if _FIRESTORE_PROXY_DOCUMENT is not None:
-        expected_version = _FIRESTORE_PROXY_VERSION
-        next_payload = {**payload, "version": expected_version + 1}
-        serialized_size = len(json.dumps(next_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        if serialized_size > 900_000:
-            raise HTTPException(status_code=413, detail="قائمة البروكسيات أكبر من الحد الآمن لوثيقة Firestore.")
-        def commit_if_current():
-            transaction = _FIRESTORE_CLIENT.transaction()
-
-            @firestore.transactional
-            def update(tx):
-                snapshots = list(tx.get_all([_FIRESTORE_PROXY_DOCUMENT]))
-                snapshot = snapshots[0] if snapshots else None
-                current_version = _proxy_payload_version(snapshot.to_dict() if snapshot.exists else None)
-                if not snapshot.exists or current_version != expected_version:
-                    raise RuntimeError("proxy_dashboard_conflict")
-                tx.set(_FIRESTORE_PROXY_DOCUMENT, next_payload)
-                return current_version + 1
-
-            return update(transaction)
-
-        try:
-            _FIRESTORE_PROXY_VERSION = await asyncio.to_thread(commit_if_current)
-        except RuntimeError as exc:
-            if str(exc) == "proxy_dashboard_conflict":
-                # Reject the stale write, but first replace the in-process pool
-                # with the winning remote version so subsequent reads are fresh.
-                latest_snapshot = await asyncio.to_thread(_FIRESTORE_PROXY_DOCUMENT.get)
-                if not latest_snapshot.exists:
-                    raise HTTPException(status_code=503, detail="تعذر استعادة إعدادات البروكسيات بعد التعارض.") from None
-                latest_payload = latest_snapshot.to_dict() or {}
-                latest_entries = _normalize_proxy_dashboard_entries(latest_payload.get("proxies"))
-                if latest_entries is None:
-                    raise HTTPException(status_code=503, detail="وثيقة البروكسيات البعيدة غير صالحة بعد التعارض.") from None
-                async with _PROXY_LOCK:
-                    _PROXY_ADMIN_ENTRIES = [dict(proxy) for proxy in latest_entries]
-                    _PROXY_POOL = [dict(proxy) for proxy in latest_entries if proxy.get("enabled", True)]
-                    _ACTIVE_PROXY_INDEX = 0
-                    _FIRESTORE_PROXY_VERSION = _proxy_payload_version(latest_payload)
-                raise HTTPException(status_code=409, detail="تعارض: تغيّر إعداد البروكسيات في نسخة أخرى. أعد تحميل الصفحة قبل الحفظ.") from None
-            raise
-    else:
-        parent = os.path.dirname(PROXY_DASHBOARD_FILE) or "."
-        os.makedirs(parent, exist_ok=True)
-        temp_path = f"{PROXY_DASHBOARD_FILE}.{secrets.token_hex(8)}.tmp"
-        try:
-            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(descriptor, "w", encoding="utf-8") as state_file:
-                json.dump(payload, state_file, ensure_ascii=False, separators=(",", ":"))
-                state_file.flush()
-                os.fsync(state_file.fileno())
-            os.replace(temp_path, PROXY_DASHBOARD_FILE)
-            os.chmod(PROXY_DASHBOARD_FILE, 0o600)
-        finally:
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except OSError:
-                pass
-
-    source_lines = []
-    for proxy in entries:
-        line = f"{proxy['host']}:{proxy['port']}:{proxy['username']}:{proxy['password']}"
-        source_lines.append(line if proxy.get("enabled", True) else f"# disabled: {line}")
-    encoded = base64.b64encode(("\n".join(source_lines) + ("\n" if source_lines else "")).encode("utf-8")).decode("ascii")
-    async with _PROXY_LOCK:
-        _PROXY_ADMIN_ENTRIES = [dict(proxy) for proxy in entries]
-        _PROXY_POOL = [dict(proxy) for proxy in entries if proxy.get("enabled", True)]
-        _ACTIVE_PROXY_INDEX = 0
-        os.environ["TIKWAHM_PROXY_LIST_B64"] = encoded
-
-
-async def _initialize_proxy_storage():
-    """Load Firestore state or migrate the existing file/environment list once."""
-    global _PROXY_ADMIN_ENTRIES, _PROXY_POOL, _ACTIVE_PROXY_INDEX, _FIRESTORE_PROXY_VERSION
-    if _FIRESTORE_PROXY_DOCUMENT is None:
-        return
-
-    snapshot = await asyncio.to_thread(_FIRESTORE_PROXY_DOCUMENT.get)
-    if snapshot.exists:
-        payload = snapshot.to_dict() or {}
-        entries = _normalize_proxy_dashboard_entries(payload.get("proxies"))
-        if entries is None:
-            raise RuntimeError("وثيقة البروكسيات في Firestore غير صالحة؛ أوقف التشغيل لتجنب فقد البيانات.")
-        remote_version = _proxy_payload_version(payload)
-    else:
-        entries = _PROXY_ADMIN_ENTRIES
-        payload = {"version": 1, "saved_at": int(time.time()), "proxies": entries}
-        serialized_size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-        if serialized_size > 900_000:
-            raise RuntimeError("قائمة البروكسيات أكبر من الحد الآمن لوثيقة Firestore.")
-        try:
-            await asyncio.to_thread(_FIRESTORE_PROXY_DOCUMENT.create, payload)
-        except AlreadyExists:
-            snapshot = await asyncio.to_thread(_FIRESTORE_PROXY_DOCUMENT.get)
-            if not snapshot.exists:
-                raise RuntimeError("تعذر قراءة وثيقة البروكسيات بعد تعارض الترحيل.")
-            payload = snapshot.to_dict() or {}
-            entries = _normalize_proxy_dashboard_entries(payload.get("proxies"))
-            if entries is None:
-                raise RuntimeError("وثيقة البروكسيات في Firestore غير صالحة؛ أوقف التشغيل لتجنب فقد البيانات.")
-            remote_version = _proxy_payload_version(payload)
-        else:
-            remote_version = 1
-
-    async with _PROXY_LOCK:
-        _PROXY_ADMIN_ENTRIES = [dict(proxy) for proxy in entries]
-        _PROXY_POOL = [dict(proxy) for proxy in entries if proxy.get("enabled", True)]
-        _ACTIVE_PROXY_INDEX = 0
-        _FIRESTORE_PROXY_VERSION = remote_version
-
-
-async def _test_proxy_connection(proxy):
-    def check():
-        proxy_url = (
-            f"http://{quote(proxy['username'], safe='')}:{quote(proxy['password'], safe='')}"
-            f"@{proxy['host']}:{proxy['port']}"
-        )
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
-        )
-        request = urllib.request.Request(
-            "https://api.ipify.org?format=json",
-            headers={"User-Agent": "TikWahm-Proxy-Check/1.0"},
-        )
-        try:
-            with opener.open(request, timeout=12) as response:
-                data = json.loads(response.read(512).decode("utf-8", "replace"))
-            ip = str(data.get("ip", ""))
-            return {"ok": bool(ip), "ip": ip[:80]}
-        except Exception as exc:
-            return {"ok": False, "reason": type(exc).__name__}
-
-    return await asyncio.to_thread(check)
 
 _CONNECTION_FAILURE_MARKERS = (
     "err_proxy_connection_failed",
@@ -852,21 +582,13 @@ _PROVIDER_DENIAL_MARKERS = (
     "robot check",
 )
 _PROVIDER_RESTRICTION_MESSAGE = (
-    "رفض المصدر الطلب عبر أحد البروكسيات أو فرض تحققًا أمنيًا. "
-    "تم تدوير البروكسي وتجربة المتاح دون نجاح؛ جرّب لاحقًا."
+    "المصدر أبلغ عن حظر أو تحقق أمني أو رفض وصول في هذه المحاولة. "
+    "تم تبديل البروكسي للمحاولة القادمة؛ جرّب إعادة المحاولة."
 )
 
 
 class _ProxyConnectionBroken(Exception):
     """Raised only for an explicit transport/proxy connection failure."""
-
-
-class _RetryableTikipError(Exception):
-    """Raised for source failures that are safe to retry with another proxy."""
-
-
-class _ProviderRejectedTikipError(Exception):
-    """Raised when Tikip rejects a request so the caller can rotate proxies."""
 
 
 def _is_connection_failure(error_or_text) -> bool:
@@ -882,30 +604,16 @@ def _proxy_launch_config(proxy):
     }
 
 
-def _proxy_key(proxy):
-    return (
-        proxy.get("id") or proxy.get("host"),
-        proxy.get("port"),
-        proxy.get("username"),
-    )
-
-
-async def _get_next_proxy(excluded=None):
-    """سحب بروكسي غير مستخدم في البحث مع تدوير ذري للمؤشر."""
+async def _get_next_proxy():
+    """سحب البروكسي الحالي وتقديم المؤشر للبروكسي التالي تلقائياً لكل محاولة."""
     global _ACTIVE_PROXY_INDEX
-    excluded = excluded or set()
     async with _PROXY_LOCK:
         total = len(_PROXY_POOL)
         if total == 0:
             return None, -1
-        for offset in range(total):
-            current_index = (_ACTIVE_PROXY_INDEX + offset) % total
-            proxy = _PROXY_POOL[current_index]
-            if _proxy_key(proxy) in excluded:
-                continue
-            _ACTIVE_PROXY_INDEX = (current_index + 1) % total
-            return proxy, current_index
-        return None, -1
+        current_index = _ACTIVE_PROXY_INDEX % total
+        _ACTIVE_PROXY_INDEX = (current_index + 1) % total
+        return _PROXY_POOL[current_index], current_index
 
 
 async def _page_shows_provider_restriction(page, denied_statuses) -> bool:
@@ -987,13 +695,13 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
                 )
             except Exception as exc:
                 if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    raise _ProviderRejectedTikipError from exc
+                    return _PROVIDER_RESTRICTION_MESSAGE
                 if _is_connection_failure(exc) or connection_failures:
                     raise _ProxyConnectionBroken from exc
                 raise
 
             if await _page_shows_provider_restriction(page, denied_statuses):
-                raise _ProviderRejectedTikipError
+                return _PROVIDER_RESTRICTION_MESSAGE
 
             _set_progress(progress, "البحث عن الحساب وجمع بياناته")
             try:
@@ -1023,43 +731,38 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
                 )
             except Exception as exc:
                 if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    raise _ProviderRejectedTikipError from exc
+                    return _PROVIDER_RESTRICTION_MESSAGE
                 if _is_connection_failure(exc) or connection_failures:
                     raise _ProxyConnectionBroken from exc
                 raise
 
             if await _page_shows_provider_restriction(page, denied_statuses):
-                raise _ProviderRejectedTikipError
+                return _PROVIDER_RESTRICTION_MESSAGE
 
             if not isinstance(api_result, dict):
                 if connection_failures:
                     raise _ProxyConnectionBroken
-                raise _RetryableTikipError("invalid_browser_response")
+                return "تعذر قراءة رد مصدر البيانات. جرّب مرة أخرى لاحقًا."
             if api_result.get("error"):
                 if connection_failures:
                     raise _ProxyConnectionBroken
                 if "abort" in str(api_result["error"]).casefold():
-                    raise _RetryableTikipError("source_timeout")
-                raise _ProxyConnectionBroken
+                    return "انتهت مهلة مصدر البيانات. جرّب إعادة المحاولة لاحقًا."
+                return "تعذر الاتصال بمصدر البيانات. جرّب إعادة المحاولة لاحقًا."
 
             status = api_result.get("status")
             if status in {401, 403, 429}:
-                raise _ProviderRejectedTikipError
+                return _PROVIDER_RESTRICTION_MESSAGE
             if not isinstance(status, int) or status < 200 or status >= 300:
                 if connection_failures:
                     raise _ProxyConnectionBroken
-                if isinstance(status, int) and status >= 500:
-                    raise _RetryableTikipError(f"source_http_{status}")
                 return f"رفض مصدر البيانات الطلب (HTTP {status}). جرّب لاحقًا."
 
             payload = api_result.get("body")
             if not isinstance(payload, dict):
-                raise _RetryableTikipError("invalid_json")
+                return "أعاد مصدر البيانات ردًا غير مفهوم. جرّب مرة أخرى لاحقًا."
             if payload.get("status") == "error":
-                error_message = str(payload.get("message") or payload.get("error") or "")
-                if any(marker in error_message.casefold() for marker in _PROVIDER_DENIAL_MARKERS):
-                    raise _ProviderRejectedTikipError
-                return error_message or "لم يعثر المصدر على بيانات عامة للحساب."
+                return str(payload.get("message") or payload.get("error") or "لم يعثر المصدر على بيانات عامة للحساب.")
 
             _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
             return format_tikip_api_result(username, payload)
@@ -1072,7 +775,7 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
 
 
 async def fetch_data_from_tikip(username: str, progress=None):
-    """نفّذ دورة بحث محدودة، مع حجز بروكسي مختلف لكل محاولة فاشلة أو مكتملة."""
+    """يتم تغيير البروكسي تلقائياً مع كل محاولة بحث جديدة، وعند فشل الاتصال يتم الانتقال للتالي فوراً."""
     if not _PROXY_POOL:
         return (
             "لا يمكن إجراء البحث: ملف إعداد البروكسي غير متاح أو لا يحتوي إدخالات صالحة. "
@@ -1080,43 +783,27 @@ async def fetch_data_from_tikip(username: str, progress=None):
         )
 
     total_proxies = len(_PROXY_POOL)
-    last_error = None
-    saw_provider_rejection = False
-    used_proxies = set()
     for _ in range(total_proxies):
-        proxy, proxy_index = await _get_next_proxy(used_proxies)
+        proxy, proxy_index = await _get_next_proxy()
         if proxy is None:
             break
-        used_proxies.add(_proxy_key(proxy))
         print(f"Using proxy slot #{proxy_index + 1}/{total_proxies} for @{username}", flush=True)
         try:
             async with _BROWSER_SEMAPHORE:
-                result = await asyncio.wait_for(
-                    _fetch_once_through_proxy(username, proxy, progress),
-                    timeout=SOURCE_ATTEMPT_TIMEOUT_SECONDS,
-                )
+                result = await _fetch_once_through_proxy(username, proxy, progress)
             return result
         except _ProxyConnectionBroken:
             # في حال فشل الاتصال بالبروكسي، تستمر الحلقة وتجرب البروكسي التالي تلقائياً
             print(f"Proxy slot #{proxy_index + 1} connection failed, rotating to next...", flush=True)
             continue
-        except _ProviderRejectedTikipError:
-            saw_provider_rejection = True
-            print(f"Proxy slot #{proxy_index + 1} was rejected by Tikip, rotating to next...", flush=True)
-            continue
-        except (asyncio.TimeoutError, PlaywrightTimeoutError, _RetryableTikipError):
-            last_error = "انتهت مهلة أو تعذر قراءة رد مصدر البيانات."
-            print(f"Proxy slot #{proxy_index + 1} timed out, rotating to next...", flush=True)
-            continue
+        except PlaywrightTimeoutError:
+            return "انتهت مهلة تحميل صفحة البحث. تم تبديل البروكسي، حاول مرة أخرى."
         except Exception as exc:
-            last_error = f"تعذر إكمال البحث بسبب مشكلة في المتصفح أو الموقع ({type(exc).__name__})."
-            print(f"Proxy slot #{proxy_index + 1} failed ({type(exc).__name__}), rotating to next...", flush=True)
-            continue
+            return (
+                "تعذر إكمال البحث بسبب مشكلة في المتصفح أو الموقع "
+                f"({type(exc).__name__}). تم تبديل البروكسي، حاول مرة أخرى."
+            )
 
-    if saw_provider_rejection:
-        return _PROVIDER_RESTRICTION_MESSAGE
-    if last_error:
-        return f"{last_error} جُرّبت البروكسيات المتاحة، حاول مرة أخرى لاحقًا."
     return (
         "تعذر الاتصال عبر جميع البروكسيات المتاحة في القائمة بسبب أعطال اتصال."
     )
@@ -1128,33 +815,10 @@ def _arabic_digits(value) -> str:
 
 def _progress_message(username: str, percent: int, headline: str = "") -> str:
     percent = max(0, min(100, int(percent)))
-    frame = PROGRESS_FRAMES[
-        int(time.monotonic() / PROGRESS_ANIMATION_INTERVAL) % len(PROGRESS_FRAMES)
-    ]
     filled = percent // 10
-    bar = "▰" * filled + "▱" * (10 - filled)
-    title = headline or f"جارٍ البحث عن @{username}"
-    return f"{frame} {title}\n\n{bar} {_arabic_digits(percent)}٪"
-
-
-def _progress_text_rich_message(text: str) -> types.InputRichMessage:
-    lines = str(text).splitlines()
-    if len(lines) >= 3 and not lines[1]:
-        frame, _, title = lines[0].partition(" ")
-        progress = lines[2]
-        content = (
-            '<table compact><tr>'
-            f'<td align="center"><b>{html.escape(frame)}</b></td>'
-            f'<td>{html.escape(title)}</td>'
-            '</tr><tr><td colspan="2">'
-            f'<code>{html.escape(progress)}</code>'
-            '</td></tr></table>'
-        )
-    else:
-        content = "<p>" + "<br>".join(
-            html.escape(line) if line else "&nbsp;" for line in lines
-        ) + "</p>"
-    return types.InputRichMessage(html=content, is_rtl=True)
+    bar = "🟦" * filled + "⬜" * (10 - filled)
+    title = headline or f"🔎 جارٍ البحث عن @{username}"
+    return f"{title}\n\n{bar} {_arabic_digits(percent)}٪"
 
 
 def _progress_rich_message(text: str, media_source: str) -> types.InputRichMessage:
@@ -1188,6 +852,33 @@ def _progress_animation_file_id(wait_msg) -> str:
         if file_id:
             return file_id
     return ""
+
+
+async def _send_rich_progress_message(message, text: str):
+    """Upload the GIF as an attached rich-message animation (no public host needed)."""
+    with open(LOADING_GIF_PATH, "rb") as animation:
+        rich_message = _progress_rich_message(
+            text, f"attach://{PROGRESS_ATTACHMENT_NAME}"
+        )
+        result = await asyncio_helper._process_request(
+            bot.token,
+            "sendRichMessage",
+            method="post",
+            params={
+                "chat_id": str(message.chat.id),
+                "rich_message": rich_message.to_json(),
+                "reply_parameters": types.ReplyParameters(
+                    message_id=message.message_id
+                ).to_json(),
+            },
+            files={
+                PROGRESS_ATTACHMENT_NAME: (
+                    os.path.basename(LOADING_GIF_PATH),
+                    animation,
+                )
+            },
+        )
+    return types.Message.de_json(result)
 
 
 def _retry_markup(username: str):
@@ -1243,28 +934,35 @@ def _get_or_start_lookup(username: str, force_fresh: bool = False):
 
 
 async def _send_wait_message(message, username: str):
-    text = _progress_message(username, 0)
+    caption = _progress_message(username, 0)
     try:
-        wait_msg = await bot.send_rich_message(
-            chat_id=message.chat.id,
-            rich_message=_progress_text_rich_message(text),
-            reply_parameters=types.ReplyParameters(message_id=message.message_id),
-        )
-        return wait_msg, "rich_text"
+        wait_msg = await _send_rich_progress_message(message, caption)
+        if not _progress_animation_file_id(wait_msg):
+            try:
+                await bot.delete_message(message.chat.id, wait_msg.message_id)
+            except Exception:
+                pass
+            raise RuntimeError("Rich progress message did not return an animation file_id")
+        return wait_msg, "rich"
     except Exception as exc:
-        print(f"Rich text progress fallback: {type(exc).__name__}", flush=True)
-        wait_msg = await bot.reply_to(message, text)
-        return wait_msg, False
+        print(f"Rich progress fallback: {type(exc).__name__}", flush=True)
+
+    try:
+        with open(LOADING_GIF_PATH, "rb") as animation:
+            wait_msg = await bot.send_animation(
+                chat_id=message.chat.id,
+                animation=animation,
+                caption=caption,
+                reply_to_message_id=message.message_id,
+            )
+        return wait_msg, "animation"
+    except Exception as exc:
+        print(f"Animation progress fallback: {type(exc).__name__}", flush=True)
+        wait_msg = await bot.reply_to(message, caption)
+        return wait_msg, "text"
 
 
 async def _edit_wait_message(chat_id, wait_msg, is_animation: bool, text: str, reply_markup=None):
-    if is_animation == "rich_text":
-        return await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=wait_msg.message_id,
-            rich_message=_progress_text_rich_message(text),
-            reply_markup=reply_markup,
-        )
     if is_animation == "rich":
         file_id = _progress_animation_file_id(wait_msg)
         if not file_id:
@@ -1431,29 +1129,19 @@ async def _retry_active_lookup(chat_id, wait_msg, username: str, is_animation: b
         )
     except Exception:
         pass
-    started = time.monotonic()
-    while not task.done():
-        elapsed = time.monotonic() - started
-        remaining = MAX_LOOKUP_SECONDS - elapsed
-        if remaining <= 0:
+    for percent in (20, 40, 60, 80, 100):
+        if task.done():
             break
         try:
             await _edit_wait_message(
                 chat_id,
                 wait_msg,
                 is_animation,
-                _progress_message(
-                    username,
-                    min(100, int(elapsed / MAX_LOOKUP_SECONDS * 100)),
-                    "🔄 جارٍ استرجاع النتيجة",
-                ),
+                _progress_message(username, percent, "🔄 جارٍ استرجاع النتيجة"),
             )
         except Exception:
             pass
-        await asyncio.wait(
-            {task},
-            timeout=min(PROGRESS_ANIMATION_INTERVAL, remaining),
-        )
+        await asyncio.wait({task}, timeout=0.5)
     if task.done():
         try:
             result = task.result()
@@ -1513,11 +1201,8 @@ async def retry_lookup_callback(call):
     _RETRY_IN_PROGRESS.add(retry_key)
     try:
         await bot.answer_callback_query(call.id)
-        rich_message = getattr(message, "rich_message", None)
         if _progress_animation_file_id(message):
-            is_animation = "rich" if rich_message else "animation"
-        elif rich_message:
-            is_animation = "rich_text"
+            is_animation = "rich" if getattr(message, "rich_message", None) else "animation"
         else:
             is_animation = False
         # إذا كان هناك بحث نشط حالياً نتابعه، وإلا نبدأ بحثاً جديداً ببروكسي جديد
@@ -1541,7 +1226,6 @@ async def retry_lookup_callback(call):
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global WEBHOOK_SECRET
-    await _initialize_proxy_storage()
     public_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not public_url:
         raise RuntimeError("RENDER_EXTERNAL_URL is required to configure Telegram webhook")
@@ -1565,40 +1249,6 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="TikWahm Test Bot", lifespan=lifespan)
 
-from proxy_admin import build_password_hash, build_proxy_admin_router
-
-_ADMIN_PASSWORD = os.environ.pop("TIKWAHM_PROXY_DASHBOARD_PASSWORD", "")
-_PROXY_ADMIN_PASSWORD_HASH = build_password_hash(_ADMIN_PASSWORD, BOT_TOKEN)
-del _ADMIN_PASSWORD
-app.include_router(
-    build_proxy_admin_router(
-        get_entries=lambda: [dict(proxy) for proxy in _PROXY_ADMIN_ENTRIES],
-        save_entries=_save_proxy_admin_entries,
-        get_session_secret=lambda: WEBHOOK_SECRET or WEBHOOK_SECRET_SEED or BOT_TOKEN,
-        test_proxy=_test_proxy_connection,
-        password_hash=_PROXY_ADMIN_PASSWORD_HASH,
-        password_pepper=lambda: BOT_TOKEN,
-        storage_backend=lambda: "firestore" if _FIRESTORE_PROXY_DOCUMENT is not None else "file",
-    )
-)
-
-@app.middleware("http")
-async def proxy_admin_security_headers(request: Request, call_next):
-    if request.url.path.startswith("/proxy-admin"):
-        forwarded_scheme = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip().lower()
-        scheme = forwarded_scheme or request.url.scheme
-        if scheme != "https":
-            return PlainTextResponse("HTTPS is required for the proxy dashboard.", status_code=400)
-    response = await call_next(request)
-    if request.url.path.startswith("/proxy-admin"):
-        response.headers["Cache-Control"] = "no-store, max-age=0"
-        response.headers["Pragma"] = "no-cache"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000"
-    return response
-
 
 @app.get("/", response_class=HTMLResponse)
 async def home_page():
@@ -1620,39 +1270,18 @@ async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
 
 
-def _claim_webhook_update(update_id):
-    if update_id is None:
-        return True
-    if update_id in _SEEN_WEBHOOK_UPDATE_IDS:
-        return False
-    _SEEN_WEBHOOK_UPDATE_IDS[update_id] = time.monotonic()
-    while len(_SEEN_WEBHOOK_UPDATE_IDS) > _WEBHOOK_UPDATE_ID_CACHE_LIMIT:
-        _SEEN_WEBHOOK_UPDATE_IDS.popitem(last=False)
-    return True
-
-
-async def _process_webhook_update(update):
-    try:
-        await bot.process_new_updates([update])
-    except Exception as exc:
-        print(f"Telegram update processing failed ({type(exc).__name__}).", flush=True)
-
-
 @app.post(WEBHOOK_PATH)
-async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
+async def telegram_webhook(request: Request):
     supplied_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
     if not WEBHOOK_SECRET or not hmac.compare_digest(supplied_secret, WEBHOOK_SECRET):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
         update = types.Update.de_json(json.dumps(await request.json()))
-        update_id = getattr(update, "update_id", None)
+        await bot.process_new_updates([update])
     except Exception as exc:
-        print(f"Telegram update parsing failed ({type(exc).__name__}).", flush=True)
-        raise HTTPException(status_code=400, detail="Invalid update") from exc
-    if not _claim_webhook_update(update_id):
-        return {"ok": True}
-    background_tasks.add_task(_process_webhook_update, update)
+        print(f"Telegram update processing failed ({type(exc).__name__}).", flush=True)
+        raise HTTPException(status_code=500, detail="Update processing failed") from exc
     return {"ok": True}
 
 
