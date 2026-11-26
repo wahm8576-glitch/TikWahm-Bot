@@ -24,7 +24,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
 
-from telebot import asyncio_helper, types
+from telebot import types
 from telebot.async_telebot import AsyncTeleBot
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
@@ -44,9 +44,8 @@ CACHE_TTL_SECONDS = 10 * 60
 SOURCE_ATTEMPT_TIMEOUT_SECONDS = 15
 SOURCE_TIMEOUT_MILLISECONDS = SOURCE_ATTEMPT_TIMEOUT_SECONDS * 1_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
-LOADING_GIF_PATH = os.path.join(os.path.dirname(__file__), "tikwahm_loading.gif")
 PROGRESS_MEDIA_ID = "tikwahm_loading"
-PROGRESS_ATTACHMENT_NAME = "loading_animation"
+PROGRESS_FRAMES = ("◐", "◓", "◑", "◒")
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
@@ -1128,10 +1127,33 @@ def _arabic_digits(value) -> str:
 
 def _progress_message(username: str, percent: int, headline: str = "") -> str:
     percent = max(0, min(100, int(percent)))
+    frame = PROGRESS_FRAMES[
+        int(time.monotonic() / PROGRESS_ANIMATION_INTERVAL) % len(PROGRESS_FRAMES)
+    ]
     filled = percent // 10
-    bar = "🟦" * filled + "⬜" * (10 - filled)
-    title = headline or f"🔎 جارٍ البحث عن @{username}"
-    return f"{title}\n\n{bar} {_arabic_digits(percent)}٪"
+    bar = "▰" * filled + "▱" * (10 - filled)
+    title = headline or f"جارٍ البحث عن @{username}"
+    return f"{frame} {title}\n\n{bar} {_arabic_digits(percent)}٪"
+
+
+def _progress_text_rich_message(text: str) -> types.InputRichMessage:
+    lines = str(text).splitlines()
+    if len(lines) >= 3 and not lines[1]:
+        frame, _, title = lines[0].partition(" ")
+        progress = lines[2]
+        content = (
+            '<table compact><tr>'
+            f'<td align="center"><b>{html.escape(frame)}</b></td>'
+            f'<td>{html.escape(title)}</td>'
+            '</tr><tr><td colspan="2">'
+            f'<code>{html.escape(progress)}</code>'
+            '</td></tr></table>'
+        )
+    else:
+        content = "<p>" + "<br>".join(
+            html.escape(line) if line else "&nbsp;" for line in lines
+        ) + "</p>"
+    return types.InputRichMessage(html=content, is_rtl=True)
 
 
 def _progress_rich_message(text: str, media_source: str) -> types.InputRichMessage:
@@ -1165,33 +1187,6 @@ def _progress_animation_file_id(wait_msg) -> str:
         if file_id:
             return file_id
     return ""
-
-
-async def _send_rich_progress_message(message, text: str):
-    """Upload the GIF as an attached rich-message animation (no public host needed)."""
-    with open(LOADING_GIF_PATH, "rb") as animation:
-        rich_message = _progress_rich_message(
-            text, f"attach://{PROGRESS_ATTACHMENT_NAME}"
-        )
-        result = await asyncio_helper._process_request(
-            bot.token,
-            "sendRichMessage",
-            method="post",
-            params={
-                "chat_id": str(message.chat.id),
-                "rich_message": rich_message.to_json(),
-                "reply_parameters": types.ReplyParameters(
-                    message_id=message.message_id
-                ).to_json(),
-            },
-            files={
-                PROGRESS_ATTACHMENT_NAME: (
-                    os.path.basename(LOADING_GIF_PATH),
-                    animation,
-                )
-            },
-        )
-    return types.Message.de_json(result)
 
 
 def _retry_markup(username: str):
@@ -1247,35 +1242,28 @@ def _get_or_start_lookup(username: str, force_fresh: bool = False):
 
 
 async def _send_wait_message(message, username: str):
-    caption = _progress_message(username, 0)
+    text = _progress_message(username, 0)
     try:
-        wait_msg = await _send_rich_progress_message(message, caption)
-        if not _progress_animation_file_id(wait_msg):
-            try:
-                await bot.delete_message(message.chat.id, wait_msg.message_id)
-            except Exception:
-                pass
-            raise RuntimeError("Rich progress message did not return an animation file_id")
-        return wait_msg, "rich"
+        wait_msg = await bot.send_rich_message(
+            chat_id=message.chat.id,
+            rich_message=_progress_text_rich_message(text),
+            reply_parameters=types.ReplyParameters(message_id=message.message_id),
+        )
+        return wait_msg, "rich_text"
     except Exception as exc:
-        print(f"Rich progress fallback: {type(exc).__name__}", flush=True)
-
-    try:
-        with open(LOADING_GIF_PATH, "rb") as animation:
-            wait_msg = await bot.send_animation(
-                chat_id=message.chat.id,
-                animation=animation,
-                caption=caption,
-                reply_to_message_id=message.message_id,
-            )
-        return wait_msg, "animation"
-    except Exception as exc:
-        print(f"Animation progress fallback: {type(exc).__name__}", flush=True)
-        wait_msg = await bot.reply_to(message, caption)
-        return wait_msg, "text"
+        print(f"Rich text progress fallback: {type(exc).__name__}", flush=True)
+        wait_msg = await bot.reply_to(message, text)
+        return wait_msg, False
 
 
 async def _edit_wait_message(chat_id, wait_msg, is_animation: bool, text: str, reply_markup=None):
+    if is_animation == "rich_text":
+        return await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=wait_msg.message_id,
+            rich_message=_progress_text_rich_message(text),
+            reply_markup=reply_markup,
+        )
     if is_animation == "rich":
         file_id = _progress_animation_file_id(wait_msg)
         if not file_id:
@@ -1524,8 +1512,11 @@ async def retry_lookup_callback(call):
     _RETRY_IN_PROGRESS.add(retry_key)
     try:
         await bot.answer_callback_query(call.id)
+        rich_message = getattr(message, "rich_message", None)
         if _progress_animation_file_id(message):
-            is_animation = "rich" if getattr(message, "rich_message", None) else "animation"
+            is_animation = "rich" if rich_message else "animation"
+        elif rich_message:
+            is_animation = "rich_text"
         else:
             is_animation = False
         # إذا كان هناك بحث نشط حالياً نتابعه، وإلا نبدأ بحثاً جديداً ببروكسي جديد
