@@ -45,7 +45,8 @@ SOURCE_ATTEMPT_TIMEOUT_SECONDS = 15
 SOURCE_TIMEOUT_MILLISECONDS = SOURCE_ATTEMPT_TIMEOUT_SECONDS * 1_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
 PROGRESS_MEDIA_ID = "tikwahm_loading"
-PROGRESS_FRAMES = ("◐", "◓", "◑", "◒")
+# Alternate compact native emoji so the loader remains inline with the title.
+PROGRESS_FRAMES = ("⏳", "⌛")
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
