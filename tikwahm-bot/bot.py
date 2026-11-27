@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 import time
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -42,12 +42,14 @@ bot = AsyncTeleBot(BOT_TOKEN)
 WEBHOOK_SECRET = ""
 WEBHOOK_SECRET_SEED = os.environ.get("WEBHOOK_SECRET", "").strip()
 WEBHOOK_PATH = "/telegram/webhook"
-TIKIP_URL = "https://tikip.us/"
-TIKIP_API_URL = "https://shinyfrydgdghfdgdgmouse-a6de.issam1996kech.workers.dev/api/v1/profile"
+FINTOK_URL = "https://fintok.neocities.org/"
+FINTOK_API_URL = "https://tiktokinfov10.itfreeforever.workers.dev"
+# Public client-side request salt from FinTok's own JavaScript; not a credential.
+FINTOK_SIGNATURE_SALT = "x2x7x1x90x79x24x001x"
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
-# Query Tikip's JSON endpoint directly; a short per-proxy timeout keeps lookups responsive.
+# Query FinTok's JSON endpoints directly; a short per-proxy timeout keeps lookups responsive.
 SOURCE_TIMEOUT_SECONDS = 8
 MAX_SOURCE_RESPONSE_BYTES = 1_000_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
@@ -418,6 +420,95 @@ def _escape_markdown(value: str) -> str:
     return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", value)
 
 
+def _fintok_display_value(value, *, compact_number=False):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return "Yes" if value else "No"
+    if compact_number:
+        number = None
+        if isinstance(value, (int, float)):
+            number = value
+        elif isinstance(value, str) and re.fullmatch(r"\d+(?:\.\d+)?", value.strip()):
+            number = float(value.strip())
+        if number is not None and number >= 1000:
+            unit, divisor = ("M", 1_000_000) if number >= 1_000_000 else ("K", 1_000)
+            compact = f"{number / divisor:.2f}".rstrip("0").rstrip(".")
+            return f"{compact}{unit}"
+    return str(value)
+
+
+def _fintok_region(value):
+    if value is None or value == "":
+        return None
+    value = str(value)
+    key = value.casefold().strip()
+    flag = COUNTRY_FLAGS.get(key)
+    if flag and flag not in value:
+        return f"{value} {flag}"
+    return value
+
+
+def format_fintok_result(username, profile, active_region, registered_region, security):
+    """Preserve the labels, values and order displayed by FinTok's profile page."""
+    profile = profile if isinstance(profile, dict) else {}
+    account = security if isinstance(security, dict) else {}
+    oauth = account.get("oauth") if isinstance(account.get("oauth"), dict) else {}
+    status = account.get("account_status") if isinstance(account.get("account_status"), dict) else {}
+    name = str(profile.get("fullname") or "")
+    handle = str(profile.get("username") or username).lstrip("@")
+    basic = [("Following", _fintok_display_value(profile.get("following"), compact_number=True)),
+             ("Followers", _fintok_display_value(profile.get("followers"), compact_number=True)),
+             ("Likes", _fintok_display_value(profile.get("likes"), compact_number=True))]
+    private = profile.get("private")
+    account_type = ("Private Account" if private else "Public Account") if isinstance(private, bool) else private
+    info = [("User ID", profile.get("userid")), ("Account Type", account_type),
+            ("Active Region", _fintok_region(active_region)),
+            ("Registered Region", _fintok_region(registered_region)),
+            ("Language", profile.get("language")), ("Created Time", profile.get("created_time")),
+            ("Last Name Change", profile.get("last_change_name"))]
+    platforms = oauth.get("platforms")
+    if isinstance(platforms, list):
+        platforms = ", ".join(str(item) for item in platforms) if platforms else None
+    security_rows = [
+        ("Email Linked", _fintok_display_value(account.get("is_email"))),
+        ("Mobile Linked", _fintok_display_value(account.get("is_mobile"))),
+        ("Password Set", _fintok_display_value(account.get("is_password"))),
+        ("is PassKey", _fintok_display_value(account.get("is_passkey"))),
+        ("OAuth Enabled", _fintok_display_value(oauth.get("is_enabled"))),
+        ("Connected Platforms", platforms),
+        ("Logged In", _fintok_display_value(status.get("is_logged_in"))),
+        ("FTC User", _fintok_display_value(status.get("is_ftc_user"))),
+        ("Most Device", _fintok_display_value(status.get("is_most_device"))),
+        ("Organization Account", _fintok_display_value(status.get("is_org_account"))),
+    ] if account else []
+    sections = [("", basic), ("Profile Information", info), ("Account Security & Status", security_rows)]
+    note = "المنطقتان وبيانات الأمان بحسب FinTok ولم يُتحقق من صحتها."
+    plain = [name, f"@{handle}", "البيان | القيمة"]
+    table = ["| البيان | القيمة |", "| --- | --- |"]
+    for title, rows in sections:
+        rows = [(label, str(value)) for label, value in rows if value is not None and value != ""]
+        if not rows:
+            continue
+        if title:
+            plain.append(title)
+            table.append(f"| **{_escape_markdown(title)}** |  |")
+        for label, value in rows:
+            plain.append(f"{label} | {value}")
+            table.append(f"| {_escape_markdown(label)} | {_escape_markdown(value)} |")
+    plain.append(note)
+
+    avatar_url = str(profile.get("profile") or "")
+    parsed = urlparse(avatar_url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.hostname in {"localhost", "127.0.0.1"}:
+        avatar_url = ""
+    rich = []
+    if avatar_url:
+        rich.append(f"![Profile]({quote(avatar_url, safe=':/?&=%@,+-_.~')})")
+    rich.extend([f"**{_escape_markdown(name)}** · `@{handle}`", "\n".join(table), _escape_markdown(note)])
+    return {"text": "\n".join(plain), "markdown": "\n\n".join(rich), "avatar_url": avatar_url}
+
+
 def format_tikip_rich_markdown(username: str, plain_text: str, avatar_url: str = "") -> str:
     """كوّن Rich Message بصيغة Markdown الموثقة رسميًا في Telegram Bot API."""
     lines = (plain_text or "").splitlines()
@@ -575,24 +666,24 @@ _PROVIDER_DENIAL_MARKERS = (
     "robot check",
 )
 _PROVIDER_RESTRICTION_MESSAGE = (
-    "رفض مصدر Tikip الطلب أو عرض تحققًا أمنيًا عبر البروكسيات المتاحة. "
+    "رفض مصدر FinTok الطلب أو عرض تحققًا أمنيًا عبر البروكسيات المتاحة. "
     "جرّب البحث مرة أخرى لاحقًا."
 )
 
 
-class _RetryableTikipError(Exception):
+class _RetryableFinTokError(Exception):
     """A transient proxy/source failure for which the next proxy should be tried."""
 
 
-class _ProxyConnectionBroken(_RetryableTikipError):
+class _ProxyConnectionBroken(_RetryableFinTokError):
     """Raised only for an explicit transport/proxy connection failure."""
 
 
-class _TikipRequestRejected(_RetryableTikipError):
+class _FinTokRequestRejected(_RetryableFinTokError):
     """Raised when Tikip refuses a request or shows a challenge page."""
 
 
-class _TikipAttemptTimedOut(_RetryableTikipError):
+class _FinTokAttemptTimedOut(_RetryableFinTokError):
     """Raised when a direct Tikip API request times out."""
 
 
@@ -608,8 +699,13 @@ async def _get_next_proxy():
         return _PROXY_POOL[current_index], current_index
 
 
-def _request_tikip_payload(username: str, proxy):
-    """Request Tikip's JSON API through one proxy without loading its website."""
+def _fintok_signature(timestamp, *parts):
+    signature_input = "".join(map(str, parts)) + str(timestamp) + FINTOK_SIGNATURE_SALT
+    return hashlib.sha256(signature_input.encode("utf-8")).hexdigest()
+
+
+def _request_fintok_payload(path, params, signature_parts, proxy):
+    """Use FinTok's own public client protocol through the selected proxy only."""
     proxy_url = (
         f"http://{quote(proxy['username'], safe='')}:{quote(proxy['password'], safe='')}"
         f"@{proxy['host']}:{proxy['port']}"
@@ -617,14 +713,17 @@ def _request_tikip_payload(username: str, proxy):
     opener = urllib.request.build_opener(
         urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
     )
-    endpoint = f"{TIKIP_API_URL}?username={quote(username, safe='')}"
+    timestamp = int(time.time())
+    params = {**params, "ts": timestamp}
+    endpoint = f"{FINTOK_API_URL}{path}?{urlencode(params)}"
     request = urllib.request.Request(
         endpoint,
         headers={
             "Accept": "application/json",
             "Cache-Control": "no-cache",
-            "Origin": TIKIP_URL.rstrip("/"),
-            "Referer": TIKIP_URL,
+            "Origin": FINTOK_URL.rstrip("/"),
+            "Referer": FINTOK_URL,
+            "x-token": _fintok_signature(timestamp, *signature_parts),
             "User-Agent": "Mozilla/5.0 (compatible; TikWahm/1.0)",
         },
     )
@@ -636,53 +735,80 @@ def _request_tikip_payload(username: str, proxy):
     except urllib.error.HTTPError as exc:
         exc.close()
         if exc.code in {401, 403, 429}:
-            raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
-        raise _TikipRequestRejected(f"Tikip HTTP {exc.code}") from exc
+            raise _FinTokRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
+        raise _FinTokRequestRejected(f"FinTok HTTP {exc.code}") from exc
     except (socket.timeout, TimeoutError) as exc:
-        raise _TikipAttemptTimedOut from exc
+        raise _FinTokAttemptTimedOut from exc
     except urllib.error.URLError as exc:
         reason = exc.reason
         reason_text = str(reason or exc).casefold()
         if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in reason_text:
-            raise _TikipAttemptTimedOut from exc
+            raise _FinTokAttemptTimedOut from exc
         raise _ProxyConnectionBroken from exc
     except OSError as exc:
         if "timed out" in str(exc).casefold():
-            raise _TikipAttemptTimedOut from exc
+            raise _FinTokAttemptTimedOut from exc
         raise _ProxyConnectionBroken from exc
 
     if not isinstance(status, int) or status < 200 or status >= 300:
-        raise _TikipRequestRejected(f"Tikip HTTP {status}")
+        raise _FinTokRequestRejected(f"FinTok HTTP {status}")
     if len(raw_body) > MAX_SOURCE_RESPONSE_BYTES:
-        raise _TikipRequestRejected("Tikip returned an oversized response")
+        raise _FinTokRequestRejected("FinTok returned an oversized response")
     try:
         payload = json.loads(raw_body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise _TikipRequestRejected("Tikip returned an invalid response") from exc
+        raise _FinTokRequestRejected("FinTok returned an invalid response") from exc
     if not isinstance(payload, dict):
-        raise _TikipRequestRejected("Tikip returned an invalid response")
+        raise _FinTokRequestRejected("FinTok returned an invalid response")
     return payload
 
 
 async def _fetch_once_through_proxy(username: str, proxy, progress=None):
-    """Fetch a single JSON result through a proxy without launching a browser."""
+    """Fetch the four endpoint results as FinTok does, using the same proxy."""
     _set_progress(progress, "البحث عن الحساب وجمع بياناته")
-    payload = await asyncio.to_thread(_request_tikip_payload, username, proxy)
-    if str(payload.get("status", "")).casefold() == "error":
-        payload_text = json.dumps(payload, ensure_ascii=False).casefold()
+    async def request(path, params, parts):
+        return await asyncio.to_thread(_request_fintok_payload, path, params, parts, proxy)
+
+    # Fetch account details and the security section concurrently, like the site.
+    profile_payload, security_payload = await asyncio.gather(
+        request("/", {"username": username}, (username,)),
+        request("/security", {"username": username}, (username,)),
+    )
+    if str(profile_payload.get("status", "")).casefold() != "ok":
+        message = str(profile_payload.get("message") or profile_payload.get("error") or "")
+        payload_text = json.dumps(profile_payload, ensure_ascii=False).casefold()
         if any(marker in payload_text for marker in _PROVIDER_DENIAL_MARKERS):
-            raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
-        return str(
-            payload.get("message")
-            or payload.get("error")
-            or "لم يعثر المصدر على بيانات عامة للحساب."
-        )
-
+            raise _FinTokRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
+        return message or "لم يعثر المصدر على بيانات عامة للحساب."
+    security_text = json.dumps(security_payload, ensure_ascii=False).casefold()
+    if any(marker in security_text for marker in _PROVIDER_DENIAL_MARKERS):
+        raise _FinTokRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
+    profile = profile_payload.get("data")
+    if not isinstance(profile, dict):
+        raise _FinTokRequestRejected("FinTok returned an invalid profile")
+    uid, secid = profile.get("userid"), profile.get("secUid")
+    if not uid or not secid:
+        raise _FinTokRequestRejected("FinTok profile is missing the IDs required for region lookup")
+    params = {"userid": uid, "secid": secid}
+    active, registered = await asyncio.gather(
+        request("/active", params, (uid, secid)),
+        request("/registered", params, (uid, secid)),
+    )
+    if str(active.get("status", "")).casefold() != "ok" or str(registered.get("status", "")).casefold() != "ok":
+        raise _FinTokRequestRejected("FinTok did not return both region results")
+    active_data = active.get("data") if isinstance(active.get("data"), dict) else {}
+    registered_data = registered.get("data") if isinstance(registered.get("data"), dict) else {}
+    active_region = active_data.get("active_region")
+    registered_region = registered_data.get("registered_region")
+    msg = security_payload.get("msg") if isinstance(security_payload.get("msg"), dict) else {}
+    security = msg.get("account_info")
+    if not isinstance(security, dict):
+        raise _FinTokRequestRejected("FinTok returned an invalid security section")
     _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
-    return format_tikip_api_result(username, payload)
+    return format_fintok_result(username, profile, active_region, registered_region, security)
 
 
-async def fetch_data_from_tikip(username: str, progress=None):
+async def fetch_data_from_fintok(username: str, progress=None):
     """يتم تغيير البروكسي تلقائياً مع كل محاولة بحث جديدة، وعند فشل الاتصال يتم الانتقال للتالي فوراً."""
     if not _PROXY_POOL:
         return (
@@ -702,7 +828,7 @@ async def fetch_data_from_tikip(username: str, progress=None):
             async with _SOURCE_SEMAPHORE:
                 result = await _fetch_once_through_proxy(username, proxy, progress)
             print(
-                f"Proxy slot #{proxy_index + 1} completed Tikip JSON request in "
+                f"Proxy slot #{proxy_index + 1} completed FinTok JSON request in "
                 f"{time.monotonic() - attempt_started:.2f}s.",
                 flush=True,
             )
@@ -714,7 +840,7 @@ async def fetch_data_from_tikip(username: str, progress=None):
                 flush=True,
             )
             continue
-        except (_TikipAttemptTimedOut, asyncio.TimeoutError, TimeoutError):
+        except (_FinTokAttemptTimedOut, asyncio.TimeoutError, TimeoutError):
             saw_timeout = True
             print(
                 f"Proxy slot #{proxy_index + 1} timed out after "
@@ -722,17 +848,17 @@ async def fetch_data_from_tikip(username: str, progress=None):
                 flush=True,
             )
             continue
-        except _TikipRequestRejected:
+        except _FinTokRequestRejected:
             saw_rejection = True
             print(
-                f"Proxy slot #{proxy_index + 1} was rejected by Tikip after "
+                f"Proxy slot #{proxy_index + 1} was rejected by FinTok after "
                 f"{time.monotonic() - attempt_started:.2f}s; rotating to next...",
                 flush=True,
             )
             continue
         except Exception as exc:
             return (
-                "تعذر إكمال البحث بسبب مشكلة في المتصفح أو الموقع "
+                "تعذر إكمال البحث بسبب مشكلة في مصدر FinTok أو البروكسي "
                 f"({type(exc).__name__}). حاول مرة أخرى لاحقًا."
             )
 
@@ -841,7 +967,7 @@ async def _lookup_and_cache(username: str):
     try:
         try:
             result = await asyncio.wait_for(
-                fetch_data_from_tikip(username), timeout=CACHE_TTL_SECONDS
+                fetch_data_from_fintok(username), timeout=CACHE_TTL_SECONDS
             )
         except asyncio.TimeoutError:
             result = "نعتذر، لم تكتمل عملية البحث. اضغط إعادة المحاولة مجددًا."
@@ -1499,6 +1625,25 @@ async def home_page():
 @app.get("/health")
 async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
+
+
+@app.post("/__test/username-search")
+async def test_username_search(request: Request):
+    supplied = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(supplied, f"Bearer {BOT_TOKEN}"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    payload = await request.json()
+    username = normalize_username(str(payload.get("username") or ""))
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid username")
+    started = time.monotonic()
+    result = await fetch_data_from_fintok(username)
+    return {
+        "ok": True,
+        "username": username,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "result": result,
+    }
 
 
 def _claim_webhook_update(update_id):
