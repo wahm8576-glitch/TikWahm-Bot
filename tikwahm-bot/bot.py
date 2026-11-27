@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
-from PIL import Image, ImageOps
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import uvicorn
 
 try:
@@ -1729,14 +1729,16 @@ async def _bridgly_list_button_callback(call, list_kind):
         )
         return
 
-    users = await _prepare_bridgly_list_avatars(users)
-    rich_message = _format_bridgly_list_rich_message(
-        lookup["username"], users, list_kind
-    )
     try:
-        await bot.send_rich_message(chat_id=destination, rich_message=rich_message)
+        card_image = await _create_bridgly_list_image(
+            lookup["username"], users, list_kind
+        )
+        await bot.send_photo(
+            chat_id=destination,
+            photo=types.InputFile(BytesIO(card_image), file_name="tikwahm-list.jpg"),
+        )
     except Exception as exc:
-        print(f"Bridgly rich-list delivery failed: {type(exc).__name__}", flush=True)
+        print(f"Bridgly card-list delivery failed: {type(exc).__name__}", flush=True)
         await bot.send_message(
             chat_id=destination,
             text=_format_bridgly_list_text(lookup["username"], users, list_kind),
@@ -2435,6 +2437,135 @@ async def _create_avatar_thumbnail_bounded(avatar_url):
     task = asyncio.create_task(asyncio.to_thread(_create_avatar_thumbnail, avatar_url))
     task.add_done_callback(lambda _task: semaphore.release())
     return await asyncio.shield(task)
+
+
+def _render_bridgly_list_image(username, users, list_kind, thumbnails):
+    width = 1080
+    padding = 52
+    header_height = 166
+    row_height = 164
+    rows = list((users or [])[:MAX_FOLLOWER_NAMES])
+    height = padding * 2 + header_height + row_height * max(1, len(rows))
+    image = Image.new("RGB", (width, height), "#f2f6fa")
+    draw = ImageDraw.Draw(image)
+    regular_path = "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"
+    bold_path = "/usr/share/fonts/truetype/noto/NotoSansArabic-Bold.ttf"
+    latin_regular_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    latin_bold_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    regular = ImageFont.truetype(regular_path, 34, layout_engine=ImageFont.Layout.RAQM)
+    bold = ImageFont.truetype(bold_path, 48, layout_engine=ImageFont.Layout.RAQM)
+    account_font = ImageFont.truetype(latin_regular_path, 34, layout_engine=ImageFont.Layout.RAQM)
+    handle_font = ImageFont.truetype(latin_regular_path, 34, layout_engine=ImageFont.Layout.RAQM)
+
+    title = (
+        "قائمة المتابعين"
+        if list_kind == "followers"
+        else "قائمة الحسابات التي يتابعها"
+    )
+    draw.text((width - padding, padding + 2), title, font=bold, fill="#17364d",
+              anchor="rt", direction="rtl", language="ar")
+    account_label = "الحساب"
+    account_username = f"@{str(username or '').strip().lstrip('@')}"
+    account_y = padding + 76
+    label_bbox = draw.textbbox((0, 0), account_label, font=account_font,
+                               direction="rtl", language="ar")
+    label_width = label_bbox[2] - label_bbox[0]
+    draw.text((width - padding, account_y), account_label, font=account_font,
+              fill="#527080", anchor="rt", direction="rtl", language="ar")
+    draw.text((width - padding - label_width - 12, account_y), account_username,
+              font=handle_font, fill="#527080", anchor="rt", direction="ltr")
+
+    if not rows:
+        draw.rounded_rectangle(
+            (padding, padding + header_height, width - padding, height - padding),
+            radius=24, fill="#ffffff", outline="#d9e3ea", width=2,
+        )
+        draw.text((width - padding * 2, padding + header_height + 42),
+                  "لم يُعد المصدر أسماءً لهذه القائمة.", font=regular,
+                  fill="#526a79", anchor="rt", direction="rtl", language="ar")
+    else:
+        for index, user in enumerate(rows):
+            top = padding + header_height + index * row_height
+            bottom = top + row_height - 12
+            draw.rounded_rectangle(
+                (padding, top, width - padding, bottom), radius=24,
+                fill="#ffffff", outline="#d9e3ea", width=2,
+            )
+            avatar_size = 112
+            avatar_x = padding + 26
+            avatar_y = top + (bottom - top - avatar_size) // 2
+            thumbnail = thumbnails[index] if index < len(thumbnails) else None
+            if thumbnail:
+                try:
+                    with Image.open(BytesIO(thumbnail)) as avatar:
+                        avatar = ImageOps.fit(avatar.convert("RGB"), (avatar_size, avatar_size))
+                        mask = Image.new("L", (avatar_size, avatar_size), 0)
+                        ImageDraw.Draw(mask).rounded_rectangle(
+                            (0, 0, avatar_size - 1, avatar_size - 1), radius=22, fill=255
+                        )
+                        image.paste(avatar, (avatar_x, avatar_y), mask)
+                except Exception:
+                    thumbnail = None
+            if not thumbnail:
+                draw.rounded_rectangle(
+                    (avatar_x, avatar_y, avatar_x + avatar_size, avatar_y + avatar_size),
+                    radius=22, fill="#d9e7ee",
+                )
+                draw.ellipse(
+                    (avatar_x + 39, avatar_y + 22, avatar_x + 73, avatar_y + 56),
+                    fill="#7895a3",
+                )
+                draw.ellipse(
+                    (avatar_x + 24, avatar_y + 58, avatar_x + 88, avatar_y + 106),
+                    fill="#7895a3",
+                )
+
+            nickname = str(user.get("nickname") or "اسم غير متاح").strip()
+            handle = str(user.get("handle") or "").strip().lstrip("@")
+            text_right = width - padding - 28
+            max_text_width = text_right - (avatar_x + avatar_size + 30)
+            has_arabic = any("\u0600" <= character <= "\u06ff" for character in nickname)
+            has_latin = any(character.isascii() and character.isalpha() for character in nickname)
+            name_font_path = latin_bold_path if has_latin else bold_path
+            name_direction = "rtl" if has_arabic else "ltr"
+            name_language = "ar" if has_arabic else "en"
+            name_font = ImageFont.truetype(
+                name_font_path, 48, layout_engine=ImageFont.Layout.RAQM
+            )
+
+            def text_width(text, font):
+                bbox = draw.textbbox((0, 0), text, font=font,
+                                     direction=name_direction, language=name_language)
+                return bbox[2] - bbox[0]
+
+            while name_font.size > 32 and text_width(nickname, name_font) > max_text_width:
+                name_font = ImageFont.truetype(
+                    name_font_path, name_font.size - 2,
+                    layout_engine=ImageFont.Layout.RAQM
+                )
+            if text_width(nickname, name_font) > max_text_width:
+                shortened = nickname
+                while shortened and text_width(shortened + "…", name_font) > max_text_width:
+                    shortened = shortened[:-1]
+                nickname = shortened + "…" if shortened else "اسم غير متاح"
+            draw.text((text_right, top + 38), nickname, font=name_font,
+                      fill="#17364d", anchor="rt", direction=name_direction,
+                      language=name_language)
+            if handle:
+                draw.text((text_right, top + 102), f"@{handle}", font=handle_font,
+                          fill="#527080", anchor="rt", direction="ltr")
+
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=86, optimize=True)
+    return output.getvalue()
+
+
+async def _create_bridgly_list_image(username, users, list_kind):
+    rows = list((users or [])[:MAX_FOLLOWER_NAMES])
+    thumbnails = await asyncio.gather(*[
+        _create_avatar_thumbnail_bounded(user.get("avatar_url")) for user in rows
+    ])
+    return _render_bridgly_list_image(username, rows, list_kind, thumbnails)
 
 
 async def _prepare_bridgly_list_avatars(users):

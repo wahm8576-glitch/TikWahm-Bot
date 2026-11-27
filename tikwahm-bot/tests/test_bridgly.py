@@ -245,6 +245,20 @@ class BridglyListTests(unittest.TestCase):
         self.assertEqual(self.arun(scenario()), [b"tiny-jpeg"] * 10)
         self.assertLessEqual(peak, 3)
 
+    def test_composited_list_image_is_a_single_jpeg_and_caps_rows_at_five(self):
+        from io import BytesIO
+        from PIL import Image
+
+        users = self.sample_users() + [{"handle": "extra", "nickname": "Extra"}]
+        avatar_buffer = BytesIO()
+        Image.new("RGB", (88, 88), "teal").save(avatar_buffer, format="JPEG")
+        card = bot._render_bridgly_list_image(
+            "menharef", users, "followers", [avatar_buffer.getvalue()] * 6
+        )
+        rendered = Image.open(BytesIO(card))
+        self.assertEqual(rendered.format, "JPEG")
+        self.assertEqual(rendered.size, (1080, 1090))
+
     def test_avatar_thumbnail_route_serves_only_short_lived_cached_images(self):
         async def scenario():
             with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": "https://tikwahm-bot-new.onrender.com"}), \
@@ -316,7 +330,7 @@ class BridglyListTests(unittest.TestCase):
             with self.assertRaises(bot._BridglyRequestError):
                 bot._request_bridgly_social_list("sample", "followers")
 
-    def test_both_buttons_call_the_correct_direction_and_send_rich_list(self):
+    def test_both_buttons_call_the_correct_direction_and_send_composited_photo(self):
         for list_kind, handler in (
             ("followers", bot.followers_button_callback),
             ("following", bot.following_button_callback),
@@ -331,19 +345,44 @@ class BridglyListTests(unittest.TestCase):
                     bot, "_get_bridgly_social_list", new_callable=AsyncMock,
                     return_value=users,
                 ) as fetch, patch.object(
+                    bot, "_create_bridgly_list_image", new_callable=AsyncMock,
+                    return_value=b"one-composited-jpeg",
+                ) as render_image, patch.object(
                     bot.bot, "answer_callback_query", new_callable=AsyncMock,
                 ), patch.object(
-                    bot.bot, "send_rich_message", new_callable=AsyncMock,
-                ) as send_rich, patch.object(
+                    bot.bot, "send_photo", new_callable=AsyncMock,
+                ) as send_photo, patch.object(
                     bot.bot, "send_message", new_callable=AsyncMock,
                 ) as send_text:
                     self.arun(handler(call))
 
                 fetch.assert_awaited_once_with("menharef", list_kind)
-                rich = send_rich.await_args.kwargs["rich_message"]
-                self.assertEqual(rich.blocks[0].text, "قائمة المتابعين" if list_kind == "followers" else "قائمة الحسابات التي يتابعها")
-                self.assertEqual(len([b for b in rich.blocks if isinstance(b, bot.types.InputRichBlockPhoto)]), 5)
+                render_image.assert_awaited_once_with("menharef", users, list_kind)
+                self.assertIsInstance(send_photo.await_args.kwargs["photo"], bot.types.InputFile)
                 send_text.assert_not_awaited()
+
+    def test_photo_render_failure_keeps_plain_text_fallback(self):
+        call = self.callback(list_kind="followers", callback_id="followers-render-fail")
+        users = self.sample_users("fallback")
+        with patch.object(
+            bot, "_get_country_lookup", new_callable=AsyncMock,
+            return_value={"username": "menharef"},
+        ), patch.object(
+            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            return_value=users,
+        ), patch.object(
+            bot, "_create_bridgly_list_image", new_callable=AsyncMock,
+            side_effect=RuntimeError("render failed"),
+        ), patch.object(
+            bot.bot, "answer_callback_query", new_callable=AsyncMock,
+        ), patch.object(
+            bot.bot, "send_photo", new_callable=AsyncMock,
+        ) as send_photo, patch.object(
+            bot.bot, "send_message", new_callable=AsyncMock,
+        ) as send_message:
+            self.arun(bot.followers_button_callback(call))
+        send_photo.assert_not_awaited()
+        self.assertIn("قائمة المتابعين", send_message.await_args.kwargs["text"])
 
     def test_following_callback_handles_private_or_hidden_list_without_claiming_empty(self):
         call = self.callback(list_kind="following", callback_id="following-private")
