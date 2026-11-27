@@ -1609,19 +1609,6 @@ async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
 
 
-@app.post("/__test/username-search")
-async def test_username_search(request: Request):
-    supplied = request.headers.get("Authorization", "")
-    if not hmac.compare_digest(supplied, f"Bearer {BOT_TOKEN}"):
-        raise HTTPException(status_code=403, detail="Forbidden")
-    payload = await request.json()
-    username = normalize_username(str(payload.get("username") or ""))
-    if not username:
-        raise HTTPException(status_code=400, detail="Invalid username")
-    result = await fetch_data_from_tikip(username)
-    return {"ok": True, "username": username, "result": result}
-
-
 def _claim_webhook_update(update_id):
     if update_id is None:
         return True
