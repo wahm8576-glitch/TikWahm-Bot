@@ -47,7 +47,8 @@ TIKIP_API_URL = "https://shinyfrydgdghfdgdgmouse-a6de.issam1996kech.workers.dev/
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
-SOURCE_TIMEOUT_MILLISECONDS = CACHE_TTL_SECONDS * 1_000
+# Cap each proxy attempt so the background lookup has time to rotate through the pool.
+SOURCE_TIMEOUT_MILLISECONDS = 30_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
 LOADING_GIF_PATH = os.path.join(os.path.dirname(__file__), "tikwahm_loading.gif")
 PROGRESS_MEDIA_ID = "tikwahm_loading"
@@ -596,13 +597,25 @@ _PROVIDER_DENIAL_MARKERS = (
     "robot check",
 )
 _PROVIDER_RESTRICTION_MESSAGE = (
-    "المصدر أبلغ عن حظر أو تحقق أمني أو رفض وصول في هذه المحاولة. "
-    "تم تبديل البروكسي للمحاولة القادمة؛ جرّب إعادة المحاولة."
+    "رفض مصدر Tikip الطلب أو عرض تحققًا أمنيًا عبر البروكسيات المتاحة. "
+    "جرّب البحث مرة أخرى لاحقًا."
 )
 
 
-class _ProxyConnectionBroken(Exception):
+class _RetryableTikipError(Exception):
+    """A transient proxy/source failure for which the next proxy should be tried."""
+
+
+class _ProxyConnectionBroken(_RetryableTikipError):
     """Raised only for an explicit transport/proxy connection failure."""
+
+
+class _TikipRequestRejected(_RetryableTikipError):
+    """Raised when Tikip refuses a request or shows a challenge page."""
+
+
+class _TikipAttemptTimedOut(_RetryableTikipError):
+    """Raised when a page load or source request times out."""
 
 
 def _is_connection_failure(error_or_text) -> bool:
@@ -709,13 +722,15 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
                 )
             except Exception as exc:
                 if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    return _PROVIDER_RESTRICTION_MESSAGE
+                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
+                if isinstance(exc, (PlaywrightTimeoutError, asyncio.TimeoutError)):
+                    raise _TikipAttemptTimedOut from exc
                 if _is_connection_failure(exc) or connection_failures:
                     raise _ProxyConnectionBroken from exc
                 raise
 
             if await _page_shows_provider_restriction(page, denied_statuses):
-                return _PROVIDER_RESTRICTION_MESSAGE
+                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
 
             _set_progress(progress, "البحث عن الحساب وجمع بياناته")
             try:
@@ -745,13 +760,15 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
                 )
             except Exception as exc:
                 if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    return _PROVIDER_RESTRICTION_MESSAGE
+                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
+                if isinstance(exc, (PlaywrightTimeoutError, asyncio.TimeoutError)):
+                    raise _TikipAttemptTimedOut from exc
                 if _is_connection_failure(exc) or connection_failures:
                     raise _ProxyConnectionBroken from exc
                 raise
 
             if await _page_shows_provider_restriction(page, denied_statuses):
-                return _PROVIDER_RESTRICTION_MESSAGE
+                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
 
             if not isinstance(api_result, dict):
                 if connection_failures:
@@ -761,21 +778,24 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
                 if connection_failures:
                     raise _ProxyConnectionBroken
                 if "abort" in str(api_result["error"]).casefold():
-                    return "انتهت مهلة مصدر البيانات. جرّب إعادة المحاولة لاحقًا."
-                return "تعذر الاتصال بمصدر البيانات. جرّب إعادة المحاولة لاحقًا."
+                    raise _TikipAttemptTimedOut(str(api_result["error"]))
+                raise _ProxyConnectionBroken(str(api_result["error"]))
 
             status = api_result.get("status")
             if status in {401, 403, 429}:
-                return _PROVIDER_RESTRICTION_MESSAGE
+                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
             if not isinstance(status, int) or status < 200 or status >= 300:
                 if connection_failures:
                     raise _ProxyConnectionBroken
-                return f"رفض مصدر البيانات الطلب (HTTP {status}). جرّب لاحقًا."
+                raise _TikipRequestRejected(f"Tikip HTTP {status}")
 
             payload = api_result.get("body")
             if not isinstance(payload, dict):
-                return "أعاد مصدر البيانات ردًا غير مفهوم. جرّب مرة أخرى لاحقًا."
+                raise _TikipRequestRejected("Tikip returned an invalid response")
             if payload.get("status") == "error":
+                payload_text = json.dumps(payload, ensure_ascii=False).casefold()
+                if any(marker in payload_text for marker in _PROVIDER_DENIAL_MARKERS):
+                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
                 return str(payload.get("message") or payload.get("error") or "لم يعثر المصدر على بيانات عامة للحساب.")
 
             _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
@@ -797,6 +817,8 @@ async def fetch_data_from_tikip(username: str, progress=None):
         )
 
     total_proxies = len(_PROXY_POOL)
+    saw_timeout = False
+    saw_rejection = False
     for _ in range(total_proxies):
         proxy, proxy_index = await _get_next_proxy()
         if proxy is None:
@@ -806,16 +828,26 @@ async def fetch_data_from_tikip(username: str, progress=None):
                 result = await _fetch_once_through_proxy(username, proxy, progress)
             return result
         except _ProxyConnectionBroken:
-            # في حال فشل الاتصال بالبروكسي، تستمر الحلقة وتجرب البروكسي التالي تلقائياً
+            print(f"Proxy slot #{proxy_index + 1} failed to connect; rotating to next...", flush=True)
             continue
-        except PlaywrightTimeoutError:
-            return "انتهت مهلة تحميل صفحة البحث. تم تبديل البروكسي، حاول مرة أخرى."
+        except (_TikipAttemptTimedOut, PlaywrightTimeoutError, asyncio.TimeoutError):
+            saw_timeout = True
+            print(f"Proxy slot #{proxy_index + 1} timed out; rotating to next...", flush=True)
+            continue
+        except _TikipRequestRejected:
+            saw_rejection = True
+            print(f"Proxy slot #{proxy_index + 1} was rejected by Tikip; rotating to next...", flush=True)
+            continue
         except Exception as exc:
             return (
                 "تعذر إكمال البحث بسبب مشكلة في المتصفح أو الموقع "
-                f"({type(exc).__name__}). تم تبديل البروكسي، حاول مرة أخرى."
+                f"({type(exc).__name__}). حاول مرة أخرى لاحقًا."
             )
 
+    if saw_rejection:
+        return _PROVIDER_RESTRICTION_MESSAGE
+    if saw_timeout:
+        return "انتهت مهلة البحث عبر البروكسيات المتاحة. حاول مرة أخرى لاحقًا."
     return (
         "تعذر الاتصال عبر جميع البروكسيات المتاحة في القائمة بسبب أعطال اتصال."
     )
@@ -1575,6 +1607,19 @@ async def home_page():
 @app.get("/health")
 async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
+
+
+@app.post("/__test/username-search")
+async def test_username_search(request: Request):
+    supplied = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(supplied, f"Bearer {BOT_TOKEN}"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    payload = await request.json()
+    username = normalize_username(str(payload.get("username") or ""))
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid username")
+    result = await fetch_data_from_tikip(username)
+    return {"ok": True, "username": username, "result": result}
 
 
 def _claim_webhook_update(update_id):
