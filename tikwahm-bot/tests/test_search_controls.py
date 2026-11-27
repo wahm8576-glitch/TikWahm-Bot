@@ -309,6 +309,8 @@ class SearchControlsTests(unittest.TestCase):
         self.assertEqual(send_message.await_args.kwargs["chat_id"], 202)
         self.assertIn("17 ⭐ كل 30 يومًا", send_message.await_args.kwargs["text"])
         self.assertIn("يتجدد تلقائيًا", send_message.await_args.kwargs["text"])
+        self.assertIn("القوائم الكاملة", send_message.await_args.kwargs["text"])
+        self.assertIn("لا يوجد اشتراك أو خصم منفصل للقوائم", send_message.await_args.kwargs["text"])
         self.assertEqual(
             send_message.await_args.kwargs["reply_markup"].keyboard[0][0].text,
             "أوافق على الشروط وأتابع",
@@ -333,11 +335,14 @@ class SearchControlsTests(unittest.TestCase):
 
         create_link.assert_awaited_once()
         args = create_link.await_args.kwargs
+        self.assertEqual(args["title"], "اشتراك الدولة والقوائم الكاملة")
+        self.assertIn("القوائم الكاملة", args["description"])
         self.assertEqual(args["currency"], "XTR")
         self.assertEqual(args["provider_token"], "")
         self.assertEqual(args["subscription_period"], 2_592_000)
         self.assertEqual(len(args["prices"]), 1)
         self.assertEqual(args["prices"][0].amount, 21)
+        self.assertIn("القوائم", args["prices"][0].label)
         order_id = args["payload"]
         order = bot._COUNTRY_ORDER_CACHE[order_id]
         self.assertEqual(order["user_id"], 303)
@@ -467,7 +472,7 @@ class SearchControlsTests(unittest.TestCase):
         self.assertEqual(bot._COUNTRY_ORDER_CACHE[order_id]["status"], "paid")
         self.assertIn("charge-first", bot._COUNTRY_PROCESSED_PAYMENT_CACHE)
         send_message.assert_awaited_once()
-        self.assertIn("تم تفعيل اشتراك", send_message.await_args.kwargs["text"])
+        self.assertIn("تم تفعيل الاشتراك الموحد", send_message.await_args.kwargs["text"])
         send_photo.assert_awaited_once()
         self.assertEqual(send_photo.await_args.kwargs["photo"], "https://flagcdn.com/w160/ca.png")
 

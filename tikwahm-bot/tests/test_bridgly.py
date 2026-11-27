@@ -81,10 +81,10 @@ class BridglyListTests(unittest.TestCase):
                 "nickname": f"Name {index}",
                 "avatar_url": f"https://p16-sign-va.tiktokcdn.com/{prefix}_{index}.webp",
             }
-            for index in range(5)
+            for index in range(bot.MAX_FOLLOWER_NAMES)
         ]
 
-    def test_both_api_directions_request_five_and_render_name_handle_and_avatar(self):
+    def test_both_api_directions_request_thirteen_and_render_name_handle_and_avatar(self):
         cases = (
             ("followers", bot.BRIDGLY_FOLLOWERS_URL, bot._format_bridgly_list_text),
             ("following", bot.BRIDGLY_FOLLOWING_URL, bot._format_bridgly_list_text),
@@ -99,7 +99,7 @@ class BridglyListTests(unittest.TestCase):
                                 "nickname": f"Display {index}",
                                 "avatarUrl": f"https://p16-sign-va.tiktokcdn.com/person_{index}.webp",
                             }
-                            for index in range(7)
+                            for index in range(16)
                         ]
                     }
                 })
@@ -112,14 +112,14 @@ class BridglyListTests(unittest.TestCase):
                 self.assertEqual(request.get_method(), "POST")
                 self.assertEqual(request_body, {
                     "uniqueId": "menharef",
-                    "count": 5,
+                    "count": 13,
                     "cacheMaxAgeHours": 24,
                 })
                 self.assertEqual(
                     request.get_header("Authorization"),
                     "Bearer unit-test-key-not-for-network",
                 )
-                self.assertEqual(len(users), 5)
+                self.assertEqual(len(users), 13)
                 self.assertEqual(users[0], {
                     "handle": "person_0",
                     "nickname": "Display 0",
@@ -138,9 +138,9 @@ class BridglyListTests(unittest.TestCase):
                 self.assertEqual(rich.blocks[0].text, expected_heading)
                 self.assertEqual(rich.blocks[1].text, "الحساب @menharef")
                 photo_blocks = [block for block in rich.blocks if isinstance(block, bot.types.InputRichBlockPhoto)]
-                self.assertEqual(len(photo_blocks), 5)
+                self.assertEqual(len(photo_blocks), 13)
                 divider_blocks = [block for block in rich.blocks if isinstance(block, bot.types.InputRichBlockDivider)]
-                self.assertEqual(len(divider_blocks), 4)
+                self.assertEqual(len(divider_blocks), 12)
                 self.assertEqual(photo_blocks[0].photo.media, users[0]["avatar_url"])
                 self.assertEqual(photo_blocks[0].caption.text[0].text, "Display 0")
                 self.assertEqual(photo_blocks[0].caption.text[2], "@person_0")
@@ -157,7 +157,7 @@ class BridglyListTests(unittest.TestCase):
         self.assertNotIn("غير موثّق", text)
         self.assertNotIn("الأحدث", text)
         self.assertNotIn("آخر خمسة", text)
-        self.assertIn("👤 𝓐", text)
+        self.assertIn("١. 👤 𝓐", text)
         self.assertIn("────────────", bot._format_bridgly_list_text(
             "menharef",
             [{"handle": "one", "nickname": "First"}, {"handle": "two", "nickname": "Second"}],
@@ -245,7 +245,7 @@ class BridglyListTests(unittest.TestCase):
         self.assertEqual(self.arun(scenario()), [b"tiny-jpeg"] * 10)
         self.assertLessEqual(peak, 3)
 
-    def test_composited_list_image_is_a_single_jpeg_and_caps_rows_at_five(self):
+    def test_composited_list_image_is_a_single_jpeg_and_caps_rows_at_thirteen(self):
         from io import BytesIO
         from PIL import Image
 
@@ -253,11 +253,26 @@ class BridglyListTests(unittest.TestCase):
         avatar_buffer = BytesIO()
         Image.new("RGB", (88, 88), "teal").save(avatar_buffer, format="JPEG")
         card = bot._render_bridgly_list_image(
-            "menharef", users, "followers", [avatar_buffer.getvalue()] * 6
+            "menharef", users, "followers", [avatar_buffer.getvalue()] * 14
         )
         rendered = Image.open(BytesIO(card))
         self.assertEqual(rendered.format, "JPEG")
-        self.assertEqual(rendered.size, (1080, 1090))
+        self.assertEqual(rendered.size, (1080, 2402))
+
+    def test_free_preview_has_three_real_rows_and_ten_labeled_placeholder_rows(self):
+        from io import BytesIO
+        from PIL import Image
+
+        users = self.sample_users("preview")[:3]
+        avatar_buffer = BytesIO()
+        Image.new("RGB", (88, 88), "teal").save(avatar_buffer, format="JPEG")
+        card = bot._render_bridgly_list_image(
+            "menharef", users, "followers", [avatar_buffer.getvalue()] * 3,
+            locked_count=10,
+        )
+        rendered = Image.open(BytesIO(card))
+        self.assertEqual(rendered.size, (1080, 2494))
+        self.assertEqual(rendered.format, "JPEG")
 
     def test_avatar_thumbnail_route_serves_only_short_lived_cached_images(self):
         async def scenario():
@@ -287,14 +302,14 @@ class BridglyListTests(unittest.TestCase):
         followers = self.sample_users("follower")
         following = self.sample_users("following")
 
-        def fake_followers(username):
-            calls.append(("followers", username))
+        def fake_followers(username, count):
+            calls.append(("followers", username, count))
             time.sleep(0.03)
-            return followers
+            return followers[:count]
 
-        def fake_following(username):
-            calls.append(("following", username))
-            return following
+        def fake_following(username, count):
+            calls.append(("following", username, count))
+            return following[:count]
 
         async def scenario():
             with patch.object(bot, "_request_bridgly_followers", side_effect=fake_followers), \
@@ -305,14 +320,20 @@ class BridglyListTests(unittest.TestCase):
                 )
                 third = await bot._get_bridgly_followers("@SAMPLE")
                 followed = await bot._get_bridgly_following("sample")
-            return first, second, third, followed
+                limited = await bot._get_bridgly_followers("sample", 3)
+            return first, second, third, followed, limited
 
-        first, second, third, followed = self.arun(scenario())
-        self.assertEqual(calls, [("followers", "Sample"), ("following", "sample")])
+        first, second, third, followed, limited = self.arun(scenario())
+        self.assertEqual(calls, [
+            ("followers", "Sample", 13),
+            ("following", "sample", 13),
+            ("followers", "sample", 3),
+        ])
         self.assertEqual(first, followers)
         self.assertEqual(second, followers)
         self.assertEqual(third, followers)
         self.assertEqual(followed, following)
+        self.assertEqual(limited, followers[:3])
 
     def test_missing_api_key_fails_without_network_request(self):
         bot.BRIDGLY_API_KEY = ""
@@ -342,6 +363,12 @@ class BridglyListTests(unittest.TestCase):
                     bot, "_get_country_lookup", new_callable=AsyncMock,
                     return_value={"username": "menharef"},
                 ), patch.object(
+                    bot, "_get_country_access_settings", new_callable=AsyncMock,
+                    return_value={"mode": "paid", "stars_price": 17},
+                ), patch.object(
+                    bot, "_has_active_country_subscription", new_callable=AsyncMock,
+                    return_value=True,
+                ), patch.object(
                     bot, "_get_bridgly_social_list", new_callable=AsyncMock,
                     return_value=users,
                 ) as fetch, patch.object(
@@ -356,10 +383,56 @@ class BridglyListTests(unittest.TestCase):
                 ) as send_text:
                     self.arun(handler(call))
 
-                fetch.assert_awaited_once_with("menharef", list_kind)
-                render_image.assert_awaited_once_with("menharef", users, list_kind)
+                fetch.assert_awaited_once_with("menharef", list_kind, 13)
+                render_image.assert_awaited_once_with("menharef", users, list_kind, 0)
                 self.assertIsInstance(send_photo.await_args.kwargs["photo"], bot.types.InputFile)
+                self.assertIsNone(send_photo.await_args.kwargs["reply_markup"])
                 send_text.assert_not_awaited()
+
+    def test_free_view_fetches_only_three_and_routes_unlock_to_shared_country_subscription(self):
+        call = self.callback(list_kind="followers", callback_id="followers-locked")
+        users = self.sample_users("free")[:3]
+        with patch.object(
+            bot, "_get_country_lookup", new_callable=AsyncMock,
+            return_value={"username": "menharef"},
+        ), patch.object(
+            bot, "_get_country_access_settings", new_callable=AsyncMock,
+            return_value={"mode": "paid", "stars_price": 31},
+        ), patch.object(
+            bot, "_has_active_country_subscription", new_callable=AsyncMock,
+            return_value=False,
+        ), patch.object(
+            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            return_value=users,
+        ) as fetch, patch.object(
+            bot, "_create_bridgly_list_image", new_callable=AsyncMock,
+            return_value=b"locked-preview-jpeg",
+        ) as render_image, patch.object(
+            bot.bot, "answer_callback_query", new_callable=AsyncMock,
+        ), patch.object(
+            bot.bot, "send_photo", new_callable=AsyncMock,
+        ) as send_photo:
+            self.arun(bot.followers_button_callback(call))
+
+        fetch.assert_awaited_once_with("menharef", "followers", 3)
+        render_image.assert_awaited_once_with("menharef", users, "followers", 10)
+        markup = send_photo.await_args.kwargs["reply_markup"]
+        self.assertEqual(markup.keyboard[0][0].callback_data, "country:lookup_12345678")
+        self.assertIn("اشتراك واحد", markup.keyboard[0][0].text)
+
+    def test_locked_text_fallback_never_exposes_locked_account_fields(self):
+        users = [
+            {"handle": "visible_1", "nickname": "Visible 1"},
+            {"handle": "visible_2", "nickname": "Visible 2"},
+            {"handle": "visible_3", "nickname": "Visible 3"},
+        ]
+        text = bot._format_bridgly_list_text(
+            "menharef", users, "followers", locked_count=10
+        )
+        self.assertIn("١. 👤 Visible 1", text)
+        self.assertIn("١٣. 🔒 خانة مقفلة", text)
+        self.assertIn("ليست بيانات متابعين حقيقية", text)
+        self.assertNotIn("secret_handle", text)
 
     def test_photo_render_failure_keeps_plain_text_fallback(self):
         call = self.callback(list_kind="followers", callback_id="followers-render-fail")

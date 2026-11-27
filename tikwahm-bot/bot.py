@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 import uvicorn
 
 try:
@@ -55,7 +55,9 @@ BRIDGLY_API_KEY = os.environ.get("BRIDGLY_API_KEY", "").strip()
 BRIDGLY_LIST_CACHE_MAX_AGE_HOURS = 24
 BRIDGLY_LIST_CACHE_TTL_SECONDS = 10 * 60
 BRIDGLY_REQUEST_TIMEOUT_SECONDS = 8
-MAX_FOLLOWER_NAMES = 5
+BRIDGLY_LIST_TOTAL_COUNT = 13
+BRIDGLY_LIST_FREE_VISIBLE_COUNT = 3
+MAX_FOLLOWER_NAMES = BRIDGLY_LIST_TOTAL_COUNT
 AVATAR_THUMBNAIL_SIZE = 88
 AVATAR_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
 AVATAR_THUMBNAIL_MAX_PIXELS = 4_000_000
@@ -1611,7 +1613,7 @@ async def country_subscription_command(message):
     renewal = "التجديد التلقائي موقوف" if subscription.get("is_canceled") else "التجديد تلقائي كل 30 يومًا"
     await bot.reply_to(
         message,
-        f"اشتراك كشف الدولة نشط حتى {expiration}. {renewal}.\n"
+        f"الاشتراك الموحد للدولة والقوائم نشط حتى {expiration}. {renewal}.\n"
         "استخدم /cancel_subscription لإيقاف التجديد، أو /resume_subscription لإعادته.",
     )
 
@@ -1701,10 +1703,20 @@ async def _bridgly_list_button_callback(call, list_kind):
     if user_id is None:
         await bot.answer_callback_query(call.id, text="تعذر تحديد المستخدم.", show_alert=True)
         return
-    await bot.answer_callback_query(call.id, text="جارٍ جلب القائمة من المصدر…")
+    settings = await _get_country_access_settings()
+    subscription_active = await _has_active_country_subscription(user_id)
+    full_access = settings.get("mode") != "paid" or subscription_active
+    requested_count = MAX_FOLLOWER_NAMES if full_access else BRIDGLY_LIST_FREE_VISIBLE_COUNT
+    locked_count = 0 if full_access else MAX_FOLLOWER_NAMES - BRIDGLY_LIST_FREE_VISIBLE_COUNT
+    await bot.answer_callback_query(
+        call.id,
+        text="جارٍ جلب القائمة الكاملة…" if full_access else "جارٍ جلب أول ٣ حسابات…",
+    )
     destination = _country_delivery_chat_id(call, user_id)
     try:
-        users = await _get_bridgly_social_list(lookup["username"], list_kind)
+        users = await _get_bridgly_social_list(
+            lookup["username"], list_kind, requested_count
+        )
     except _BridglyPrivateAccountError:
         text = (
             "قائمة الحسابات التي يتابعها غير متاحة لأن حساب TikTok خاص."
@@ -1731,17 +1743,25 @@ async def _bridgly_list_button_callback(call, list_kind):
 
     try:
         card_image = await _create_bridgly_list_image(
-            lookup["username"], users, list_kind
+            lookup["username"], users, list_kind, locked_count
         )
         await bot.send_photo(
             chat_id=destination,
             photo=types.InputFile(BytesIO(card_image), file_name="tikwahm-list.jpg"),
+            reply_markup=(
+                None if full_access else _bridgly_list_unlock_markup(lookup_id)
+            ),
         )
     except Exception as exc:
         print(f"Bridgly card-list delivery failed: {type(exc).__name__}", flush=True)
         await bot.send_message(
             chat_id=destination,
-            text=_format_bridgly_list_text(lookup["username"], users, list_kind),
+            text=_format_bridgly_list_text(
+                lookup["username"], users, list_kind, locked_count
+            ),
+            reply_markup=(
+                None if full_access else _bridgly_list_unlock_markup(lookup_id)
+            ),
         )
 
 
@@ -1822,7 +1842,7 @@ async def country_pre_checkout(query):
     except Exception as exc:
         print(f"Country pre-checkout validation failed: {type(exc).__name__}", flush=True)
         valid = False
-    error_message = None if valid else "الفاتورة غير صالحة أو انتهت. أعد طلب الاشتراك من زر الدولة."
+    error_message = None if valid else "الفاتورة غير صالحة أو انتهت. أعد طلب الاشتراك من زر الدولة أو القائمة."
     await bot.answer_pre_checkout_query(
         pre_checkout_query_id=query.id,
         ok=valid,
@@ -1894,7 +1914,7 @@ async def country_successful_payment(message):
     expiration_text = datetime.fromtimestamp(expiration, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     await bot.send_message(
         chat_id=message.chat.id,
-        text=f"تم تفعيل اشتراك كشف دولة الحساب الأصلية حتى {expiration_text}. "
+        text=f"تم تفعيل الاشتراك الموحد للدولة والقوائم الكاملة حتى {expiration_text}. "
         "يتجدد كل 30 يومًا ما لم توقف التجديد عبر /cancel_subscription.",
     )
     if first_payment and order.get("requested_lookup_id"):
@@ -2211,7 +2231,7 @@ class _BridglyPrivateAccountError(_BridglyRequestError):
     """TikTok does not expose the requested following list for a private account."""
 
 
-def _request_bridgly_social_list(username, list_kind):
+def _request_bridgly_social_list(username, list_kind, count=MAX_FOLLOWER_NAMES):
     endpoints = {
         "followers": BRIDGLY_FOLLOWERS_URL,
         "following": BRIDGLY_FOLLOWING_URL,
@@ -2219,11 +2239,13 @@ def _request_bridgly_social_list(username, list_kind):
     endpoint = endpoints.get(list_kind)
     if not endpoint:
         raise ValueError("unknown Bridgly list kind")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_FOLLOWER_NAMES:
+        raise ValueError("invalid Bridgly list count")
     if not BRIDGLY_API_KEY:
         raise _BridglyConfigurationError("Bridgly API key is not configured")
     payload = json.dumps({
         "uniqueId": str(username or "").lstrip("@")[:24],
-        "count": MAX_FOLLOWER_NAMES,
+        "count": count,
         "cacheMaxAgeHours": BRIDGLY_LIST_CACHE_MAX_AGE_HOURS,
     }).encode("utf-8")
     request = urllib.request.Request(
@@ -2301,20 +2323,20 @@ def _request_bridgly_social_list(username, list_kind):
             continue
         seen.add(identity)
         users.append({"handle": handle, "nickname": nickname, "avatar_url": avatar_url})
-        if len(users) >= MAX_FOLLOWER_NAMES:
+        if len(users) >= count:
             break
     return users
 
 
-def _request_bridgly_followers(username):
-    return _request_bridgly_social_list(username, "followers")
+def _request_bridgly_followers(username, count=MAX_FOLLOWER_NAMES):
+    return _request_bridgly_social_list(username, "followers", count)
 
 
-def _request_bridgly_following(username):
-    return _request_bridgly_social_list(username, "following")
+def _request_bridgly_following(username, count=MAX_FOLLOWER_NAMES):
+    return _request_bridgly_social_list(username, "following", count)
 
 
-async def _get_bridgly_social_list(username, list_kind):
+async def _get_bridgly_social_list(username, list_kind, count=MAX_FOLLOWER_NAMES):
     requesters = {
         "followers": _request_bridgly_followers,
         "following": _request_bridgly_following,
@@ -2322,12 +2344,14 @@ async def _get_bridgly_social_list(username, list_kind):
     requester = requesters.get(list_kind)
     if requester is None:
         raise ValueError("unknown Bridgly list kind")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_FOLLOWER_NAMES:
+        raise ValueError("invalid Bridgly list count")
     normalized = str(username or "").strip().lstrip("@")[:24]
     if not normalized:
         raise _BridglyRequestError("Missing TikTok username")
     if not BRIDGLY_API_KEY:
         raise _BridglyConfigurationError("Bridgly API key is not configured")
-    cache_key = f"{list_kind}:{normalized.casefold()}"
+    cache_key = f"{list_kind}:{normalized.casefold()}:{count}"
     now = time.time()
     cached = _BRIDGLY_LIST_CACHE.get(cache_key)
     if isinstance(cached, dict) and cached.get("expires_at", 0) > now:
@@ -2341,7 +2365,7 @@ async def _get_bridgly_social_list(username, list_kind):
             return [dict(user) for user in cached.get("users", [])]
         task = _BRIDGLY_LIST_TASKS.get(cache_key)
         if task is None:
-            task = asyncio.create_task(asyncio.to_thread(requester, normalized))
+            task = asyncio.create_task(asyncio.to_thread(requester, normalized, count))
             _BRIDGLY_LIST_TASKS[cache_key] = task
 
     try:
@@ -2363,12 +2387,12 @@ async def _get_bridgly_social_list(username, list_kind):
     return [dict(user) for user in users]
 
 
-async def _get_bridgly_followers(username):
-    return await _get_bridgly_social_list(username, "followers")
+async def _get_bridgly_followers(username, count=MAX_FOLLOWER_NAMES):
+    return await _get_bridgly_social_list(username, "followers", count)
 
 
-async def _get_bridgly_following(username):
-    return await _get_bridgly_social_list(username, "following")
+async def _get_bridgly_following(username, count=MAX_FOLLOWER_NAMES):
+    return await _get_bridgly_social_list(username, "following", count)
 
 
 def _is_allowed_tiktok_avatar_url(avatar_url):
@@ -2439,13 +2463,16 @@ async def _create_avatar_thumbnail_bounded(avatar_url):
     return await asyncio.shield(task)
 
 
-def _render_bridgly_list_image(username, users, list_kind, thumbnails):
+def _render_bridgly_list_image(username, users, list_kind, thumbnails, locked_count=0):
     width = 1080
     padding = 52
     header_height = 166
     row_height = 164
     rows = list((users or [])[:MAX_FOLLOWER_NAMES])
-    height = padding * 2 + header_height + row_height * max(1, len(rows))
+    locked_count = max(0, min(MAX_FOLLOWER_NAMES - len(rows), int(locked_count or 0)))
+    display_rows = rows + [None] * locked_count
+    footer_height = 92 if locked_count else 0
+    height = padding * 2 + header_height + row_height * max(1, len(display_rows)) + footer_height
     image = Image.new("RGB", (width, height), "#f2f6fa")
     draw = ImageDraw.Draw(image)
     regular_path = "/usr/share/fonts/truetype/noto/NotoSansArabic-Regular.ttf"
@@ -2475,7 +2502,7 @@ def _render_bridgly_list_image(username, users, list_kind, thumbnails):
     draw.text((width - padding - label_width - 12, account_y), account_username,
               font=handle_font, fill="#527080", anchor="rt", direction="ltr")
 
-    if not rows:
+    if not display_rows:
         draw.rounded_rectangle(
             (padding, padding + header_height, width - padding, height - padding),
             radius=24, fill="#ffffff", outline="#d9e3ea", width=2,
@@ -2484,13 +2511,55 @@ def _render_bridgly_list_image(username, users, list_kind, thumbnails):
                   "لم يُعد المصدر أسماءً لهذه القائمة.", font=regular,
                   fill="#526a79", anchor="rt", direction="rtl", language="ar")
     else:
-        for index, user in enumerate(rows):
+        for index, user in enumerate(display_rows):
             top = padding + header_height + index * row_height
             bottom = top + row_height - 12
             draw.rounded_rectangle(
                 (padding, top, width - padding, bottom), radius=24,
                 fill="#ffffff", outline="#d9e3ea", width=2,
             )
+            if user is None:
+                blur_width = width - 2 * padding - 12
+                blur_height = bottom - top - 12
+                placeholder = Image.new("RGB", (blur_width, blur_height), "#e8eff3")
+                placeholder_draw = ImageDraw.Draw(placeholder)
+                placeholder_draw.ellipse((26, 18, 116, 108), fill="#c7d5dc")
+                placeholder_draw.rounded_rectangle(
+                    (150, 30, blur_width - 35, 62), radius=16, fill="#c7d5dc"
+                )
+                placeholder_draw.rounded_rectangle(
+                    (150, 76, blur_width - 110, 100), radius=12, fill="#d2dee4"
+                )
+                placeholder = placeholder.filter(ImageFilter.GaussianBlur(8))
+                image.paste(placeholder, (padding + 6, top + 6))
+                draw.rounded_rectangle(
+                    (padding, top, width - padding, bottom), radius=24,
+                    outline="#cbd8df", width=2,
+                )
+                draw.text(
+                    (width - padding - 28, top + 24), _arabic_digits(index + 1),
+                    font=regular, fill="#527080", anchor="rt", direction="rtl",
+                    language="ar",
+                )
+                lock_center_x = width // 2
+                lock_center_y = top + 56
+                draw.arc(
+                    (lock_center_x - 18, lock_center_y - 26, lock_center_x + 18, lock_center_y + 12),
+                    180, 360, fill="#537183", width=7,
+                )
+                draw.rounded_rectangle(
+                    (lock_center_x - 25, lock_center_y, lock_center_x + 25, lock_center_y + 38),
+                    radius=8, fill="#537183",
+                )
+                draw.ellipse(
+                    (lock_center_x - 4, lock_center_y + 11, lock_center_x + 4, lock_center_y + 19),
+                    fill="#ffffff",
+                )
+                draw.text(
+                    (lock_center_x, bottom - 24), "خانة مقفلة", font=regular,
+                    fill="#526a79", anchor="mm", direction="rtl", language="ar",
+                )
+                continue
             avatar_size = 112
             avatar_x = padding + 26
             avatar_y = top + (bottom - top - avatar_size) // 2
@@ -2521,6 +2590,7 @@ def _render_bridgly_list_image(username, users, list_kind, thumbnails):
                 )
 
             nickname = str(user.get("nickname") or "اسم غير متاح").strip()
+            nickname = f"{_arabic_digits(index + 1)}. {nickname}"
             handle = str(user.get("handle") or "").strip().lstrip("@")
             text_right = width - padding - 28
             max_text_width = text_right - (avatar_x + avatar_size + 30)
@@ -2555,17 +2625,23 @@ def _render_bridgly_list_image(username, users, list_kind, thumbnails):
                 draw.text((text_right, top + 102), f"@{handle}", font=handle_font,
                           fill="#527080", anchor="rt", direction="ltr")
 
+    if locked_count:
+        draw.text(
+            (width - padding, padding + header_height + row_height * len(display_rows) + 30),
+            "الخانات المقفلة مواضع توضيحية وليست بيانات متابعين حقيقية.",
+            font=regular, fill="#526a79", anchor="rt", direction="rtl", language="ar",
+        )
     output = BytesIO()
     image.save(output, format="JPEG", quality=86, optimize=True)
     return output.getvalue()
 
 
-async def _create_bridgly_list_image(username, users, list_kind):
+async def _create_bridgly_list_image(username, users, list_kind, locked_count=0):
     rows = list((users or [])[:MAX_FOLLOWER_NAMES])
     thumbnails = await asyncio.gather(*[
         _create_avatar_thumbnail_bounded(user.get("avatar_url")) for user in rows
     ])
-    return _render_bridgly_list_image(username, rows, list_kind, thumbnails)
+    return _render_bridgly_list_image(username, rows, list_kind, thumbnails, locked_count)
 
 
 async def _prepare_bridgly_list_avatars(users):
@@ -2602,7 +2678,7 @@ async def _prepare_bridgly_list_avatars(users):
     return prepared
 
 
-def _format_bridgly_list_text(username, users, list_kind):
+def _format_bridgly_list_text(username, users, list_kind, locked_count=0):
     username = str(username or "").lstrip("@")
     title = (
         "قائمة المتابعين"
@@ -2617,11 +2693,15 @@ def _format_bridgly_list_text(username, users, list_kind):
         if handle or nickname:
             entries.append((nickname or "اسم غير متاح", handle))
     for index, (nickname, handle) in enumerate(entries):
-        lines.append(f"\n👤 {nickname}")
+        lines.append(f"\n{_arabic_digits(index + 1)}. 👤 {nickname}")
         if handle:
             lines.append(f"@{handle}")
         if index < len(entries) - 1:
             lines.append("────────────")
+    for index in range(max(0, int(locked_count or 0))):
+        lines.append(f"\n{_arabic_digits(len(entries) + index + 1)}. 🔒 خانة مقفلة")
+    if locked_count:
+        lines.append("\nالخانات المقفلة مواضع توضيحية وليست بيانات متابعين حقيقية.")
     if not entries:
         lines.append("لم يُعد المصدر أسماءً لهذه القائمة.")
     return "\n".join(lines)
@@ -2629,6 +2709,15 @@ def _format_bridgly_list_text(username, users, list_kind):
 
 def _format_followers_message(username, users):
     return _format_bridgly_list_text(username, users, "followers")
+
+
+def _bridgly_list_unlock_markup(lookup_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "اشتراك واحد يفتح القوائم والدولة",
+        callback_data=f"country:{lookup_id}",
+    ))
+    return markup
 
 
 def _format_bridgly_list_rich_message(username, users, list_kind):
@@ -2926,7 +3015,9 @@ def _country_terms_text(price=None):
         if isinstance(price, int) and price > 0 else "السعر المدفوع إن فُعّل سيظهر قبل الدفع.\n"
     )
     return (
-        "شروط كشف دولة الحساب الأصلية\n\n"
+        "شروط الاشتراك الموحد للدولة والقوائم\n\n"
+        "اشتراك واحد يفتح دولة الحساب الأصلية والقوائم الكاملة للمتابعين والحسابات التي يتابعها؛ "
+        "لا يوجد اشتراك أو خصم منفصل للقوائم.\n"
         "الاشتراك خدمة رقمية تُحصّل عبر Telegram Stars، ومدته الثابتة 30 يومًا "
         "ويتجدد تلقائيًا كل 30 يومًا ما لم توقف التجديد. لا يدعم Telegram تغيير "
         "مدة الاشتراك المتكرر إلى أيام أو ساعات أو دقائق. يبقى الوصول متاحًا حتى "
@@ -3012,12 +3103,12 @@ async def _create_or_reuse_country_order(user_id, lookup, price):
         await _set_pending_country_order(user_id, order_id)
         if not order.get("invoice_link"):
             order["invoice_link"] = await bot.create_invoice_link(
-                title="اشتراك كشف دولة الحساب الأصلية",
-                description="اشتراك رقمي متجدد كل 30 يومًا لكشف دولة الحساب الأصلية في نتائج البحث.",
+                title="اشتراك الدولة والقوائم الكاملة",
+                description="اشتراك رقمي متجدد كل 30 يومًا لفتح دولة الحساب الأصلية والقوائم الكاملة.",
                 payload=order_id,
                 provider_token="",
                 currency="XTR",
-                prices=[types.LabeledPrice(label="اشتراك كشف الدولة لمدة شهر", amount=int(price))],
+                prices=[types.LabeledPrice(label="اشتراك الدولة والقوائم لمدة شهر", amount=int(price))],
                 subscription_period=_COUNTRY_SUBSCRIPTION_PERIOD_SECONDS,
             )
             await _store_country_order(order_id, order)
@@ -3028,13 +3119,13 @@ async def _send_country_invoice_link(user_id, order_id, order):
     invoice_link = order.get("invoice_link")
     if not invoice_link:
         invoice_link = await bot.create_invoice_link(
-            title="اشتراك كشف دولة الحساب الأصلية",
-            description="اشتراك رقمي متجدد كل 30 يومًا لكشف دولة الحساب الأصلية في نتائج البحث.",
+            title="اشتراك الدولة والقوائم الكاملة",
+            description="اشتراك رقمي متجدد كل 30 يومًا لفتح دولة الحساب الأصلية والقوائم الكاملة.",
             payload=order_id,
             provider_token="",
             currency="XTR",
             prices=[types.LabeledPrice(
-                label="اشتراك كشف الدولة لمدة شهر", amount=int(order["amount"])
+                label="اشتراك الدولة والقوائم لمدة شهر", amount=int(order["amount"])
             )],
             subscription_period=_COUNTRY_SUBSCRIPTION_PERIOD_SECONDS,
         )
@@ -3043,7 +3134,7 @@ async def _send_country_invoice_link(user_id, order_id, order):
     await bot.send_message(
         chat_id=user_id,
         text=(
-            f"وافقْت على الشروط. رابط الاشتراك الشهري: {order['amount']} ⭐ كل 30 يومًا. "
+            f"وافقْت على الشروط. الاشتراك الموحد للدولة والقوائم: {order['amount']} ⭐ كل 30 يومًا. "
             "لا يتم تفعيل الوصول إلا بعد تأكيد Telegram للدفع. "
             "يمكنك إيقاف التجديد عبر /cancel_subscription."
         ),
