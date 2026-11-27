@@ -34,6 +34,7 @@ except ImportError:  # Firebase is optional for local/mock runs.
 
 from telebot import asyncio_helper, types
 from telebot.async_telebot import AsyncTeleBot
+import pycountry
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -51,7 +52,7 @@ FINTOK_SIGNATURE_SALT = "x2x7x1x90x79x24x001x"
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
-USER_SEARCH_COOLDOWN_SECONDS = 15
+USER_SEARCH_COOLDOWN_SECONDS = 20
 # Query FinTok's JSON endpoints directly; a short per-proxy timeout keeps lookups responsive.
 SOURCE_TIMEOUT_SECONDS = 8
 MAX_SOURCE_RESPONSE_BYTES = 1_000_000
@@ -64,8 +65,14 @@ _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
 _COUNTRY_LOOKUP_CACHE = {}
 _COUNTRY_ORDER_CACHE = {}
-_COUNTRY_ENTITLEMENT_CACHE = set()
+_COUNTRY_SUBSCRIPTION_CACHE = {}
+_COUNTRY_PENDING_ORDER_CACHE = {}
+_COUNTRY_PROCESSED_PAYMENT_CACHE = set()
 _COUNTRY_ACCESS_SETTINGS_CACHE = {"mode": "free", "stars_price": 0}
+_COUNTRY_ORDER_LOCK = asyncio.Lock()
+_COUNTRY_PAYMENT_LOCK = asyncio.Lock()
+_PENDING_COOLDOWN_SEARCHES = {}
+_SUPPORT_PENDING_USER_IDS = set()
 _ADMIN_USER_ID = None
 _ADMIN_PENDING_PRICE_USER_ID = None
 _USER_SEARCH_LAST_AT = OrderedDict()
@@ -145,6 +152,99 @@ COUNTRY_FLAGS = {
     "canada": "🇨🇦",
     "australia": "🇦🇺",
 }
+
+_COUNTRY_ISO2_FALLBACK = {
+    "italy": "IT", "saudi arabia": "SA", "united states": "US",
+    "united kingdom": "GB", "united arab emirates": "AE", "egypt": "EG",
+    "kuwait": "KW", "qatar": "QA", "bahrain": "BH", "oman": "OM",
+    "jordan": "JO", "iraq": "IQ", "turkey": "TR", "türkiye": "TR",
+    "france": "FR", "germany": "DE", "canada": "CA", "australia": "AU",
+    "south korea": "KR", "republic of korea": "KR", "north korea": "KP",
+    "russia": "RU", "iran": "IR", "syria": "SY", "palestine": "PS",
+    "taiwan": "TW", "hong kong": "HK", "china": "CN", "japan": "JP",
+    "india": "IN", "pakistan": "PK", "bangladesh": "BD", "indonesia": "ID",
+    "malaysia": "MY", "singapore": "SG", "philippines": "PH", "thailand": "TH",
+    "vietnam": "VN", "new zealand": "NZ", "brazil": "BR", "mexico": "MX",
+    "south africa": "ZA", "spain": "ES", "netherlands": "NL", "switzerland": "CH",
+    "ukraine": "UA", "poland": "PL", "sweden": "SE", "norway": "NO",
+    "denmark": "DK", "austria": "AT", "belgium": "BE", "portugal": "PT",
+    "greece": "GR", "ireland": "IE", "finland": "FI", "czechia": "CZ",
+    "czech republic": "CZ", "argentina": "AR", "chile": "CL", "colombia": "CO",
+    "peru": "PE", "nigeria": "NG", "kenya": "KE", "morocco": "MA",
+    "tunisia": "TN", "algeria": "DZ", "lebanon": "LB", "israel": "IL",
+    "yemen": "YE", "sudan": "SD", "libya": "LY", "afghanistan": "AF",
+    "nepal": "NP", "sri lanka": "LK", "myanmar": "MM", "cambodia": "KH",
+    "turks and caicos islands": "TC", "côte d'ivoire": "CI", "ivory coast": "CI",
+}
+_COUNTRY_FLAG_CDN = "https://flagcdn.com/w160"
+
+
+def _country_iso_code(country_text):
+    """Resolve a FinTok country/region label to an ISO-3166 alpha-2 code."""
+    if not country_text:
+        return None
+    text = str(country_text).strip()
+    flag_pairs = re.findall(r"[\U0001F1E6-\U0001F1FF]{2}", text)
+    for pair in flag_pairs:
+        code = "".join(chr(ord(char) - 0x1F1E6 + ord("A")) for char in pair)
+        if pycountry.countries.get(alpha_2=code):
+            return code.lower()
+
+    cleaned = re.sub(r"(?i)(?:source|المصدر)\s*:\s*.*$", "", text)
+    cleaned = re.sub(r"[\U0001F1E6-\U0001F1FF]+", " ", cleaned)
+    segments = re.split(r"[—–|,()/]+", cleaned)
+    for segment in segments:
+        candidate = re.sub(r"\s+", " ", segment).strip(" \t.:;-")
+        if not candidate:
+            continue
+        fallback = _COUNTRY_ISO2_FALLBACK.get(candidate.casefold())
+        if fallback:
+            return fallback.lower()
+        if re.fullmatch(r"[A-Za-z]{2,3}", candidate):
+            try:
+                country = pycountry.countries.lookup(candidate)
+                return country.alpha_2.lower()
+            except LookupError:
+                pass
+        try:
+            country = pycountry.countries.lookup(candidate)
+            return country.alpha_2.lower()
+        except LookupError:
+            pass
+        for key, arabic_name in COUNTRIES_AR.items():
+            if candidate.casefold() == arabic_name.casefold():
+                return (_COUNTRY_ISO2_FALLBACK.get(key) or "").lower() or None
+
+    folded = cleaned.casefold()
+    aliases = []
+    for country in pycountry.countries:
+        aliases.extend((
+            getattr(country, "common_name", ""),
+            getattr(country, "official_name", ""),
+            country.name,
+        ))
+    for alias in sorted({name for name in aliases if name}, key=len, reverse=True):
+        if re.search(r"(?<![a-z])" + re.escape(alias.casefold()) + r"(?![a-z])", folded):
+            try:
+                return pycountry.countries.lookup(alias).alpha_2.lower()
+            except LookupError:
+                continue
+    for key, arabic_name in COUNTRIES_AR.items():
+        if arabic_name.casefold() in folded:
+            return (_COUNTRY_ISO2_FALLBACK.get(key) or "").lower() or None
+    return None
+
+
+def _flag_emoji_from_iso2(country_code):
+    if not isinstance(country_code, str) or not re.fullmatch(r"[A-Za-z]{2}", country_code):
+        return ""
+    return "".join(chr(ord(char.upper()) - ord("A") + 0x1F1E6) for char in country_code)
+
+
+def _country_flag_png_url(country_text):
+    code = _country_iso_code(country_text)
+    return f"{_COUNTRY_FLAG_CDN}/{code}.png" if code else None
+
 
 LANGUAGES_AR = {
     "ar": "العربية",
@@ -463,8 +563,10 @@ def _fintok_region(value):
          if key.startswith(name.casefold())),
         None,
     )
-    flag = COUNTRY_FLAGS.get(country, "")
-    arabic_name = COUNTRIES_AR.get(country)
+    country_code = _country_iso_code(value)
+    flag = COUNTRY_FLAGS.get(country, "") if country else ""
+    flag = flag or _flag_emoji_from_iso2(country_code)
+    arabic_name = COUNTRIES_AR.get(country) if country else None
     if arabic_name and arabic_name not in value:
         value = f"{arabic_name} — {value}"
     if flag and flag not in value:
@@ -472,6 +574,7 @@ def _fintok_region(value):
     if "fintok" not in value.casefold():
         value = f"{value} — المصدر: FinTok"
     return value
+
 
 
 def _fintok_account_type(value):
@@ -1029,7 +1132,7 @@ def _prune_lookup_cache():
 
 
 async def _reserve_user_search(user_id, now=None):
-    """Reserve one search slot per Telegram user for each 15-second window."""
+    """Reserve one search slot per Telegram user for each 20-second window."""
     if user_id is None:
         return 0
     key = str(user_id)
@@ -1063,7 +1166,7 @@ def _search_cooldown_text(remaining: int) -> str:
 
 async def _run_search_cooldown_countdown(
     chat_id, wait_msg, is_animation, deadline, *, initial_seconds=None,
-    clock=None, sleep=None,
+    clock=None, sleep=None, completion_text="✅ البحث متاح الآن، أرسل اسم المستخدم من جديد.",
 ):
     clock = clock or time.monotonic
     sleep = sleep or asyncio.sleep
@@ -1090,13 +1193,21 @@ async def _run_search_cooldown_countdown(
             chat_id,
             wait_msg,
             is_animation,
-            "✅ البحث متاح الآن، أرسل اسم المستخدم من جديد.",
+            completion_text,
         )
     except Exception:
         pass
 
 
-async def _send_search_cooldown_message(message, remaining):
+async def _send_search_cooldown_message(message, remaining, username=None):
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    queued_key = str(user_id) if username and user_id is not None else None
+    if queued_key and queued_key in _PENDING_COOLDOWN_SEARCHES:
+        _PENDING_COOLDOWN_SEARCHES[queued_key] = (message, username)
+        return
+    if queued_key:
+        _PENDING_COOLDOWN_SEARCHES[queued_key] = (message, username)
+
     deadline = time.monotonic() + remaining
     seconds = math.ceil(remaining)
     caption = _search_cooldown_text(seconds)
@@ -1113,12 +1224,46 @@ async def _send_search_cooldown_message(message, remaining):
         print(f"Cooldown animation fallback: {type(exc).__name__}", flush=True)
         wait_msg = await bot.reply_to(message, caption)
         is_animation = False
-    await _run_search_cooldown_countdown(
-        message.chat.id,
-        wait_msg,
-        is_animation,
-        deadline,
-        initial_seconds=seconds,
+
+    try:
+        while True:
+            await _run_search_cooldown_countdown(
+                message.chat.id,
+                wait_msg,
+                is_animation,
+                deadline,
+                initial_seconds=seconds,
+                completion_text=(
+                    "✅ انتهى الانتظار؛ سيبدأ البحث تلقائيًا."
+                    if queued_key else "✅ البحث متاح الآن، أرسل اسم المستخدم من جديد."
+                ),
+            )
+            if not queued_key:
+                return
+            reserved = await _reserve_user_search(user_id)
+            if not reserved:
+                queued = _PENDING_COOLDOWN_SEARCHES.pop(queued_key, None)
+                if queued:
+                    queued_message, queued_username = queued
+                    await _start_username_search(queued_message, queued_username)
+                return
+            deadline = time.monotonic() + reserved
+            seconds = reserved
+    finally:
+        if queued_key:
+            _PENDING_COOLDOWN_SEARCHES.pop(queued_key, None)
+
+
+async def _start_username_search(message, username):
+    wait_msg, is_animation = await _send_wait_message(message, username)
+    cached_result, task, is_cached = _get_or_start_lookup(username)
+    if is_cached:
+        await _show_cached_progress(
+            message.chat.id, wait_msg, username, is_animation, cached_result
+        )
+        return
+    await _wait_for_visible_result(
+        username, wait_msg, message.chat.id, is_animation, task
     )
 
 
@@ -1404,7 +1549,77 @@ async def send_welcome(message):
     await bot.reply_to(
         message,
         "أرسل اسم مستخدم TikTok عام مثل @username أو رابط الملف، "
-        "وسأبحث عن معلومات الحساب وإحصاءاته.",
+        "وسأبحث عن معلومات الحساب وإحصاءاته. استخدم /terms لشروط كشف الدولة، "
+        "و /support للدعم، و /subscription لإدارة اشتراكك.",
+    )
+
+
+@bot.message_handler(commands=["terms"])
+async def country_terms_command(message):
+    await bot.reply_to(message, _country_terms_text())
+
+
+@bot.message_handler(commands=["support"])
+async def country_support_command(message):
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if user_id is not None:
+        _SUPPORT_PENDING_USER_IDS.add(user_id)
+    await bot.reply_to(
+        message,
+        "أرسل الآن وصف المشكلة أو رقم عملية الدفع وسأحوّله للإدارة إذا كانت متصلة. "
+        "لا ترسل كلمات مرور أو بيانات حساسة. دعم Telegram أو @botsupport "
+        "لا يستطيع معالجة مشتريات البوت.",
+    )
+
+
+@bot.message_handler(commands=["subscription", "cancel_subscription", "resume_subscription"])
+async def country_subscription_command(message):
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if user_id is None or getattr(getattr(message, "chat", None), "type", None) != "private":
+        await bot.reply_to(message, "إدارة الاشتراك متاحة في المحادثة الخاصة مع البوت.")
+        return
+    command = (getattr(message, "text", "").split()[0].split("@", 1)[0].lower())
+    subscription = await _get_country_subscription(user_id)
+    if not subscription or float(subscription.get("expires_at", 0) or 0) <= time.time():
+        await bot.reply_to(message, "لا يوجد اشتراك نشط حاليًا.")
+        return
+    if command in {"/cancel_subscription", "/resume_subscription"}:
+        charge_id = subscription.get("telegram_payment_charge_id")
+        if not charge_id:
+            await bot.reply_to(message, "تعذر العثور على مرجع الاشتراك؛ تواصل مع /support.")
+            return
+        cancel = command == "/cancel_subscription"
+        if bool(subscription.get("is_canceled")) == cancel:
+            status = "تم إيقاف التجديد مسبقًا" if cancel else "التجديد مفعّل مسبقًا"
+            await bot.reply_to(message, f"{status}. يظل الوصول متاحًا حتى نهاية الفترة الحالية.")
+            return
+        try:
+            changed = await bot.edit_user_star_subscription(
+                user_id=user_id,
+                telegram_payment_charge_id=charge_id,
+                is_canceled=cancel,
+            )
+        except Exception as exc:
+            print(f"Country subscription update failed: {type(exc).__name__}", flush=True)
+            changed = False
+        if not changed:
+            await bot.reply_to(message, "تعذر تحديث التجديد الآن. أعد المحاولة أو استخدم /support.")
+            return
+        await _update_country_subscription(user_id, {"is_canceled": cancel})
+        text = (
+            "تم إيقاف التجديد التلقائي؛ يبقى الوصول متاحًا حتى نهاية الفترة الحالية."
+            if cancel else "تمت إعادة تفعيل التجديد التلقائي."
+        )
+        await bot.reply_to(message, text)
+        return
+    expiration = datetime.fromtimestamp(
+        float(subscription.get("expires_at", 0)), timezone.utc
+    ).strftime("%Y-%m-%d %H:%M UTC")
+    renewal = "التجديد التلقائي موقوف" if subscription.get("is_canceled") else "التجديد تلقائي كل 30 يومًا"
+    await bot.reply_to(
+        message,
+        f"اشتراك كشف الدولة نشط حتى {expiration}. {renewal}.\n"
+        "استخدم /cancel_subscription لإيقاف التجديد، أو /resume_subscription لإعادته.",
     )
 
 
@@ -1424,102 +1639,199 @@ async def country_button_callback(call):
         await bot.answer_callback_query(call.id, text="تعذر تحديد المستخدم.", show_alert=True)
         return
     settings = await _get_country_access_settings()
-    country_text = f"دولة الحساب الأصلية بحسب FinTok:\n{lookup['country']}"
-    if settings.get("mode") != "paid":
-        await bot.answer_callback_query(call.id, text=country_text, show_alert=True)
+    if settings.get("mode") != "paid" or await _has_active_country_subscription(user_id):
+        await bot.answer_callback_query(call.id)
+        destination = _country_delivery_chat_id(call, user_id)
+        await _send_original_country_photo(destination, lookup)
         return
 
-    if await _has_country_entitlement(lookup_id, user_id):
-        await bot.answer_callback_query(call.id, text=country_text, show_alert=True)
-        return
-
-    message = getattr(call, "message", None)
-    if getattr(getattr(message, "chat", None), "type", None) != "private":
+    call_message = getattr(call, "message", None)
+    if getattr(getattr(call_message, "chat", None), "type", None) != "private":
         await bot.answer_callback_query(
             call.id,
-            text="افتح المحادثة الخاصة مع البوت ثم اضغط الزر مجددًا لطلب الفاتورة.",
+            text="افتح المحادثة الخاصة مع البوت ثم اضغط زر الدولة مجددًا.",
             show_alert=True,
         )
         return
 
+    try:
+        pending = await _get_pending_country_order(user_id)
+    except Exception as exc:
+        print(f"Country pending order lookup failed: {type(exc).__name__}", flush=True)
+        pending = None
+    if pending:
+        order_id, order = pending
+        if order.get("amount") == settings.get("stars_price") and order.get("status") == "pending":
+            order.update({
+                "requested_lookup_id": lookup_id,
+                "requested_country": lookup["country"],
+                "username": lookup.get("username", ""),
+            })
+            await _store_country_order(order_id, order)
+            await bot.answer_callback_query(call.id, text="لديك فاتورة اشتراك معلّقة.")
+            await _send_country_invoice_link(user_id, order_id, order)
+            return
+        await _update_country_order(order_id, {"status": "price_changed"})
+        await _clear_pending_country_order(user_id)
+
     price = settings.get("stars_price", 0)
-    if not isinstance(price, int) or price < 1:
-        await bot.answer_callback_query(call.id, text="إعداد سعر النجوم غير صالح؛ أبلغ الإدارة.", show_alert=True)
+    if not isinstance(price, int) or isinstance(price, bool) or price < 1 or price > _MAX_COUNTRY_STARS_PRICE:
+        await bot.answer_callback_query(call.id, text="إعداد سعر الاشتراك غير صالح؛ أبلغ الإدارة.", show_alert=True)
         return
-    order_id = secrets.token_urlsafe(16)
-    order = {
-        "lookup_id": lookup_id,
-        "username": lookup.get("username", ""),
-        "country": lookup["country"],
-        "user_id": user_id,
-        "currency": "XTR",
-        "amount": price,
-        "status": "pending",
-        "created_at": time.time(),
-        "expires_at": time.time() + _COUNTRY_ORDER_TTL_SECONDS,
-    }
+    await bot.answer_callback_query(call.id)
+    await bot.send_message(
+        chat_id=user_id,
+        text=_country_terms_text(price),
+        reply_markup=_country_terms_markup(lookup_id),
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("country_agree:")))
+async def country_agree_to_terms_callback(call):
+    lookup_id = (call.data or "").removeprefix("country_agree:")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", lookup_id):
+        await bot.answer_callback_query(call.id, text="تعذر قراءة بيانات الدولة.", show_alert=True)
+        return
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    call_message = getattr(call, "message", None)
+    if user_id is None or getattr(getattr(call_message, "chat", None), "type", None) != "private":
+        await bot.answer_callback_query(call.id, text="أكمل الموافقة في المحادثة الخاصة.", show_alert=True)
+        return
+    lookup = await _get_country_lookup(lookup_id)
+    if not lookup or not lookup.get("country"):
+        await bot.answer_callback_query(call.id, text="انتهت صلاحية بيانات هذا الزر. أعد البحث.", show_alert=True)
+        return
+    settings = await _get_country_access_settings()
+    if settings.get("mode") != "paid":
+        await bot.answer_callback_query(call.id, text="أصبح الكشف مجانيًا.")
+        await _send_original_country_photo(user_id, lookup)
+        return
+    if await _has_active_country_subscription(user_id):
+        await bot.answer_callback_query(call.id, text="اشتراكك نشط.")
+        await _send_original_country_photo(user_id, lookup)
+        return
+    price = settings.get("stars_price", 0)
+    if not isinstance(price, int) or isinstance(price, bool) or not 1 <= price <= _MAX_COUNTRY_STARS_PRICE:
+        await bot.answer_callback_query(call.id, text="إعداد سعر الاشتراك غير صالح.", show_alert=True)
+        return
+    await bot.answer_callback_query(call.id, text="جارٍ تجهيز رابط الاشتراك الشهري.")
     try:
-        await _store_country_order(order_id, order)
+        order_id, order = await _create_or_reuse_country_order(user_id, lookup, price)
+        await _send_country_invoice_link(user_id, order_id, order)
     except Exception as exc:
-        _COUNTRY_ORDER_CACHE.pop(order_id, None)
-        print(f"Country order storage failed: {type(exc).__name__}", flush=True)
-        await bot.answer_callback_query(
-            call.id, text="تعذر حفظ طلب الدفع. أعد المحاولة بعد قليل.", show_alert=True
-        )
-        return
-    await bot.answer_callback_query(call.id, text="جارٍ إرسال فاتورة النجوم.")
-    try:
-        await bot.send_invoice(
+        print(f"Country subscription invoice creation failed: {type(exc).__name__}", flush=True)
+        await bot.send_message(
             chat_id=user_id,
-            title="دولة الحساب الأصلية",
-            description=f"كشف دولة التسجيل لحساب @{order['username']} بحسب FinTok.",
-            invoice_payload=order_id,
-            provider_token="",
-            currency="XTR",
-            prices=[types.LabeledPrice(label="كشف دولة الحساب الأصلية", amount=price)],
-            start_parameter=order_id,
+            text="تعذر تجهيز رابط الاشتراك الآن. لم يتم تحصيل أي نجوم؛ أعد المحاولة لاحقًا.",
         )
-    except Exception as exc:
-        print(f"Country invoice creation failed: {type(exc).__name__}", flush=True)
-        try:
-            await _update_country_order(order_id, {"status": "invoice_failed"})
-        except Exception as update_exc:
-            print(f"Country invoice status update failed: {type(update_exc).__name__}", flush=True)
-        try:
-            await bot.send_message(
-                chat_id=user_id,
-                text="تعذر إنشاء فاتورة النجوم الآن. أعد الضغط على زر الدولة بعد قليل.",
-            )
-        except Exception:
-            pass
 
 
 @bot.pre_checkout_query_handler(func=lambda query: True)
 async def country_pre_checkout(query):
-    try:
-        order = await asyncio.wait_for(
-            _get_country_order(getattr(query, "invoice_payload", "")), timeout=7.0
+    async def validate():
+        order = await _get_country_order(getattr(query, "invoice_payload", ""))
+        settings = await _get_country_access_settings()
+        user = getattr(query, "from_user", None)
+        valid = bool(
+            order
+            and order.get("status") == "pending"
+            and order.get("terms_accepted_at")
+            and order.get("currency") == "XTR"
+            and getattr(query, "currency", None) == "XTR"
+            and user is not None
+            and getattr(user, "id", None) == order.get("user_id")
+            and getattr(query, "total_amount", None) == order.get("amount")
+            and order.get("expires_at", 0) > time.time()
+            and settings.get("mode") == "paid"
+            and settings.get("stars_price") == order.get("amount")
+            and not await _has_active_country_subscription(order.get("user_id"))
         )
+        return valid
+
+    try:
+        valid = await asyncio.wait_for(validate(), timeout=7.0)
     except Exception as exc:
-        print(f"Country pre-checkout lookup failed: {type(exc).__name__}", flush=True)
-        order = None
-    valid = bool(
-        order
-        and order.get("status") == "pending"
-        and order.get("currency") == "XTR"
-        and getattr(query, "currency", None) == "XTR"
-        and getattr(query, "from_user", None) is not None
-        and getattr(query.from_user, "id", None) == order.get("user_id")
-        and getattr(query, "total_amount", None) == order.get("amount")
-        and order.get("expires_at", 0) > time.time()
-        and bool(order.get("country"))
-    )
-    error_message = None if valid else "الفاتورة غير صالحة أو انتهت صلاحيتها. أعد طلبها من زر الدولة."
+        print(f"Country pre-checkout validation failed: {type(exc).__name__}", flush=True)
+        valid = False
+    error_message = None if valid else "الفاتورة غير صالحة أو انتهت. أعد طلب الاشتراك من زر الدولة."
     await bot.answer_pre_checkout_query(
         pre_checkout_query_id=query.id,
         ok=valid,
         error_message=error_message,
     )
+
+
+@bot.message_handler(content_types=["successful_payment"])
+async def country_successful_payment(message):
+    payment = getattr(message, "successful_payment", None)
+    if payment is None:
+        return
+    order_id = getattr(payment, "invoice_payload", "")
+    order = await _get_country_order(order_id)
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    charge_id = str(getattr(payment, "telegram_payment_charge_id", "") or "")
+    expiration = getattr(payment, "subscription_expiration_date", None)
+    is_recurring = getattr(payment, "is_recurring", None)
+    now = time.time()
+    try:
+        expiration = int(expiration)
+    except (TypeError, ValueError, OverflowError):
+        expiration = 0
+    first_payment = bool(order and order.get("status") == "pending")
+    valid = bool(
+        order
+        and order.get("status") in {"pending", "paid"}
+        and user_id == order.get("user_id")
+        and getattr(payment, "currency", None) == "XTR"
+        and order.get("currency") == "XTR"
+        and getattr(payment, "total_amount", None) == order.get("amount")
+        and is_recurring is True
+        and expiration > now
+        and charge_id
+        and (not first_payment or (
+            order.get("terms_accepted_at")
+            and order.get("expires_at", 0) > now
+            and getattr(payment, "is_first_recurring", None) in (None, True)
+        ))
+        and (first_payment or getattr(payment, "is_first_recurring", None) in (None, False))
+    )
+    if not valid:
+        print("Country Stars subscription payment validation failed.", flush=True)
+        return
+
+    async with _COUNTRY_PAYMENT_LOCK:
+        if await _country_payment_seen(charge_id):
+            return
+        try:
+            await _save_country_subscription_payment(
+                order_id=order_id,
+                order=order,
+                user_id=user_id,
+                charge_id=charge_id,
+                expiration=expiration,
+                payment=payment,
+            )
+        except Exception as exc:
+            print(f"Country subscription persistence failed: {type(exc).__name__}", flush=True)
+            try:
+                await bot.send_message(
+                    chat_id=message.chat.id,
+                    text="وصل تأكيد الدفع، لكن تعذر تحديث حالة الاشتراك مؤقتًا. لا تدفع مرة أخرى؛ استخدم /support.",
+                )
+            except Exception:
+                pass
+            return
+
+    expiration_text = datetime.fromtimestamp(expiration, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=f"تم تفعيل اشتراك كشف دولة الحساب الأصلية حتى {expiration_text}. "
+        "يتجدد كل 30 يومًا ما لم توقف التجديد عبر /cancel_subscription.",
+    )
+    if first_payment and order.get("requested_lookup_id"):
+        lookup = await _get_country_lookup(order["requested_lookup_id"])
+        if lookup:
+            await _send_original_country_photo(message.chat.id, lookup)
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("country_admin:")))
@@ -1559,53 +1871,6 @@ async def country_admin_callback(call):
     )
 
 
-@bot.message_handler(content_types=["successful_payment"])
-async def country_successful_payment(message):
-    payment = getattr(message, "successful_payment", None)
-    if payment is None:
-        return
-    order_id = getattr(payment, "invoice_payload", "")
-    order = await _get_country_order(order_id)
-    user_id = getattr(getattr(message, "from_user", None), "id", None)
-    valid = bool(
-        order
-        and order.get("status") == "pending"
-        and user_id == order.get("user_id")
-        and getattr(payment, "currency", None) == "XTR"
-        and order.get("currency") == "XTR"
-        and getattr(payment, "total_amount", None) == order.get("amount")
-        and bool(order.get("country"))
-    )
-    if not valid:
-        print("Country Stars payment validation failed.", flush=True)
-        return
-    charge_id = str(getattr(payment, "telegram_payment_charge_id", "") or "")
-    if not charge_id:
-        print("Country Stars payment charge id missing.", flush=True)
-        return
-    payment_updates = {
-        "status": "paid",
-        "telegram_payment_charge_id": charge_id,
-        "paid_at": time.time(),
-    }
-    try:
-        await _save_country_entitlement(
-            order["lookup_id"], user_id, order_id, charge_id, order["amount"]
-        )
-    except Exception as exc:
-        print(f"Country entitlement persistence failed: {type(exc).__name__}", flush=True)
-        _COUNTRY_ENTITLEMENT_CACHE.add(_country_entitlement_key(order["lookup_id"], user_id))
-    try:
-        await _update_country_order(order_id, payment_updates)
-    except Exception as exc:
-        print(f"Country payment record persistence failed: {type(exc).__name__}", flush=True)
-        _COUNTRY_ORDER_CACHE.setdefault(order_id, dict(order)).update(payment_updates)
-    await bot.send_message(
-        chat_id=message.chat.id,
-        text=f"دولة الحساب الأصلية بحسب FinTok:\n{order['country']}",
-    )
-
-
 @bot.message_handler(func=lambda message: True)
 async def handle_username_message(message):
     global _ADMIN_USER_ID, _ADMIN_PENDING_PRICE_USER_ID
@@ -1623,6 +1888,22 @@ async def handle_username_message(message):
             text=_country_admin_panel_text(settings),
             reply_markup=_country_admin_markup(),
         )
+        return
+
+    if user_id is not None and user_id in _SUPPORT_PENDING_USER_IDS:
+        _SUPPORT_PENDING_USER_IDS.discard(user_id)
+        support_text = raw_text.strip()[:1500] or "(رسالة دعم فارغة)"
+        if _ADMIN_USER_ID is not None:
+            try:
+                await bot.send_message(
+                    chat_id=_ADMIN_USER_ID,
+                    text=f"طلب دعم اشتراك من المستخدم {user_id}:\n{support_text}",
+                )
+                await bot.reply_to(message, "تم إرسال طلب الدعم إلى الإدارة.")
+            except Exception:
+                await bot.reply_to(message, "تعذر إرسال الطلب الآن. أعد المحاولة عبر /support.")
+        else:
+            await bot.reply_to(message, "الإدارة غير متصلة حاليًا؛ احتفظ برقم الدفع واستخدم /support لاحقًا.")
         return
 
     if user_id is not None and user_id == _ADMIN_PENDING_PRICE_USER_ID:
@@ -1659,19 +1940,10 @@ async def handle_username_message(message):
         user_id = f"chat:{message.chat.id}"
     cooldown = await _reserve_user_search(user_id)
     if cooldown:
-        await _send_search_cooldown_message(message, cooldown)
+        await _send_search_cooldown_message(message, cooldown, username=username)
         return
 
-    wait_msg, is_animation = await _send_wait_message(message, username)
-    cached_result, task, is_cached = _get_or_start_lookup(username)
-    if is_cached:
-        await _show_cached_progress(
-            message.chat.id, wait_msg, username, is_animation, cached_result
-        )
-        return
-    await _wait_for_visible_result(
-        username, wait_msg, message.chat.id, is_animation, task
-    )
+    await _start_username_search(message, username)
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("retry:")))
@@ -1786,7 +2058,8 @@ if FIREBASE_SERVICE_ACCOUNT_JSON:
 
 _COUNTRY_LOOKUP_TTL_SECONDS = 30 * 24 * 60 * 60
 _COUNTRY_ORDER_TTL_SECONDS = 30 * 60
-_MAX_COUNTRY_STARS_PRICE = 100_000
+_MAX_COUNTRY_STARS_PRICE = 10_000
+_COUNTRY_SUBSCRIPTION_PERIOD_SECONDS = 2_592_000
 
 
 def _country_button_markup(lookup_id):
@@ -1850,12 +2123,24 @@ async def _get_country_access_settings():
             snapshot = await asyncio.to_thread(_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT.get)
             if snapshot.exists:
                 stored = snapshot.to_dict() or {}
-                mode = stored.get("mode")
-                price = stored.get("stars_price")
-                if mode in {"free", "paid"} and isinstance(price, int) and not isinstance(price, bool) and 0 <= price <= _MAX_COUNTRY_STARS_PRICE:
-                    if mode == "paid" and price == 0:
-                        mode = "free"
-                    _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": mode, "stars_price": price})
+                if stored.get("billing_model") != "monthly":
+                    # Previous settings were per-result purchases; never carry paid mode
+                    # forward into the new recurring product without an explicit admin choice.
+                    stored = {
+                        "mode": "free",
+                        "stars_price": 0,
+                        "billing_model": "monthly",
+                        "updated_at": time.time(),
+                    }
+                    await asyncio.to_thread(_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT.set, stored)
+                    _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": "free", "stars_price": 0})
+                else:
+                    mode = stored.get("mode")
+                    price = stored.get("stars_price")
+                    if mode in {"free", "paid"} and isinstance(price, int) and not isinstance(price, bool) and 0 <= price <= _MAX_COUNTRY_STARS_PRICE:
+                        if mode == "paid" and price == 0:
+                            mode = "free"
+                        _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": mode, "stars_price": price})
         except Exception as exc:
             print(f"Country settings read failed: {type(exc).__name__}", flush=True)
     return dict(_COUNTRY_ACCESS_SETTINGS_CACHE)
@@ -1866,7 +2151,14 @@ async def _save_country_access_settings(mode, stars_price):
         raise ValueError("invalid country access settings")
     if not 0 <= stars_price <= _MAX_COUNTRY_STARS_PRICE:
         raise ValueError("country Stars price is out of range")
-    payload = {"mode": mode, "stars_price": stars_price, "updated_at": time.time()}
+    if mode == "paid" and stars_price < 1:
+        raise ValueError("paid country access requires a positive monthly price")
+    payload = {
+        "mode": mode,
+        "stars_price": stars_price,
+        "billing_model": "monthly",
+        "updated_at": time.time(),
+    }
     if _FIRESTORE_COUNTRY_SETTINGS_DOCUMENT is not None:
         await asyncio.to_thread(_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT.set, payload)
     _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": mode, "stars_price": stars_price})
@@ -1902,48 +2194,314 @@ async def _update_country_order(order_id, updates):
     return record
 
 
-def _country_entitlement_key(lookup_id, user_id):
-    return f"{lookup_id}_{user_id}"
+def _country_user_key(user_id):
+    return str(user_id)
 
 
-async def _has_country_entitlement(lookup_id, user_id):
-    key = _country_entitlement_key(lookup_id, user_id)
-    if key in _COUNTRY_ENTITLEMENT_CACHE:
+async def _has_active_country_subscription(user_id, now=None):
+    if user_id is None:
+        return False
+    now = time.time() if now is None else now
+    subscription = await _get_country_subscription(user_id)
+    try:
+        return bool(subscription and float(subscription.get("expires_at", 0)) > now)
+    except (TypeError, ValueError):
+        return False
+
+
+async def _get_country_subscription(user_id):
+    key = _country_user_key(user_id)
+    cached = _COUNTRY_SUBSCRIPTION_CACHE.get(key)
+    if isinstance(cached, dict) and float(cached.get("expires_at", 0) or 0) > time.time():
+        return dict(cached)
+    if _FIRESTORE_CLIENT is None:
+        return dict(cached) if isinstance(cached, dict) else None
+    try:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_subscriptions").document(key)
+        snapshot = await asyncio.to_thread(document.get)
+        if not snapshot.exists:
+            _COUNTRY_SUBSCRIPTION_CACHE.pop(key, None)
+            return None
+        record = snapshot.to_dict() or {}
+        _COUNTRY_SUBSCRIPTION_CACHE[key] = record
+        return dict(record)
+    except Exception as exc:
+        print(f"Country subscription read failed: {type(exc).__name__}", flush=True)
+        return None
+
+
+async def _update_country_subscription(user_id, updates):
+    key = _country_user_key(user_id)
+    current = await _get_country_subscription(user_id) or {"user_id": user_id}
+    current.update(updates)
+    current["updated_at"] = time.time()
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_subscriptions").document(key)
+        await asyncio.to_thread(document.set, current, merge=True)
+    _COUNTRY_SUBSCRIPTION_CACHE[key] = current
+    return dict(current)
+
+
+async def _get_pending_country_order(user_id):
+    user_key = _country_user_key(user_id)
+    order_id = _COUNTRY_PENDING_ORDER_CACHE.get(user_key)
+    if not order_id and _FIRESTORE_CLIENT is not None:
+        pointer = _FIRESTORE_CLIENT.collection("fintok_country_pending_orders").document(user_key)
+        snapshot = await asyncio.to_thread(pointer.get)
+        if snapshot.exists:
+            order_id = (snapshot.to_dict() or {}).get("order_id")
+            if order_id:
+                _COUNTRY_PENDING_ORDER_CACHE[user_key] = order_id
+    if not order_id:
+        return None
+    order = await _get_country_order(order_id)
+    if (
+        not order or order.get("status") != "pending"
+        or float(order.get("expires_at", 0) or 0) <= time.time()
+    ):
+        if order and order.get("status") == "pending":
+            await _update_country_order(order_id, {"status": "expired"})
+        await _clear_pending_country_order(user_id)
+        return None
+    return order_id, order
+
+
+async def _set_pending_country_order(user_id, order_id):
+    user_key = _country_user_key(user_id)
+    _COUNTRY_PENDING_ORDER_CACHE[user_key] = order_id
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_pending_orders").document(user_key)
+        await asyncio.to_thread(document.set, {
+            "user_id": user_id, "order_id": order_id, "updated_at": time.time(),
+        })
+
+
+async def _clear_pending_country_order(user_id):
+    user_key = _country_user_key(user_id)
+    _COUNTRY_PENDING_ORDER_CACHE.pop(user_key, None)
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_pending_orders").document(user_key)
+        await asyncio.to_thread(document.delete)
+
+
+async def _country_payment_seen(charge_id):
+    if charge_id in _COUNTRY_PROCESSED_PAYMENT_CACHE:
         return True
     if _FIRESTORE_CLIENT is None:
         return False
-    document = _FIRESTORE_CLIENT.collection("fintok_country_entitlements").document(key)
+    payment_key = hashlib.sha256(charge_id.encode("utf-8")).hexdigest()
+    document = _FIRESTORE_CLIENT.collection("fintok_country_payments").document(payment_key)
     snapshot = await asyncio.to_thread(document.get)
     if snapshot.exists:
-        _COUNTRY_ENTITLEMENT_CACHE.add(key)
+        _COUNTRY_PROCESSED_PAYMENT_CACHE.add(charge_id)
         return True
     return False
 
 
-async def _save_country_entitlement(lookup_id, user_id, order_id, charge_id, amount):
-    key = _country_entitlement_key(lookup_id, user_id)
-    record = {
-        "lookup_id": lookup_id,
+async def _save_country_subscription_payment(
+    *, order_id, order, user_id, charge_id, expiration, payment
+):
+    now = time.time()
+    user_key = _country_user_key(user_id)
+    previous = _COUNTRY_SUBSCRIPTION_CACHE.get(user_key, {})
+    if not previous and _FIRESTORE_CLIENT is not None:
+        previous = await _get_country_subscription(user_id) or {}
+    subscription = {
+        "user_id": user_id,
+        "status": "active",
+        "expires_at": int(expiration),
+        "currency": "XTR",
+        "amount": int(order["amount"]),
+        "is_recurring": True,
+        "is_canceled": False,
+        "telegram_payment_charge_id": charge_id,
+        "last_order_id": order_id,
+        "started_at": previous.get("started_at", now),
+        "updated_at": now,
+    }
+    payment_record = {
         "user_id": user_id,
         "order_id": order_id,
         "telegram_payment_charge_id": charge_id,
         "currency": "XTR",
-        "amount": amount,
-        "paid_at": time.time(),
+        "amount": int(order["amount"]),
+        "subscription_expiration_date": int(expiration),
+        "is_recurring": True,
+        "is_first_recurring": getattr(payment, "is_first_recurring", None),
+        "paid_at": now,
     }
-    _COUNTRY_ENTITLEMENT_CACHE.add(key)
+    updated_order = dict(order)
+    updated_order.update({
+        "status": "paid",
+        "telegram_payment_charge_id": charge_id,
+        "last_payment_at": now,
+        "subscription_expiration_date": int(expiration),
+    })
+
     if _FIRESTORE_CLIENT is not None:
-        document = _FIRESTORE_CLIENT.collection("fintok_country_entitlements").document(key)
-        await asyncio.to_thread(document.set, record)
+        payment_key = hashlib.sha256(charge_id.encode("utf-8")).hexdigest()
+        subscription_doc = _FIRESTORE_CLIENT.collection("fintok_country_subscriptions").document(user_key)
+        order_doc = _FIRESTORE_CLIENT.collection("fintok_country_orders").document(order_id)
+        payment_doc = _FIRESTORE_CLIENT.collection("fintok_country_payments").document(payment_key)
+        pending_doc = _FIRESTORE_CLIENT.collection("fintok_country_pending_orders").document(user_key)
+
+        def commit_records():
+            batch = _FIRESTORE_CLIENT.batch()
+            batch.set(subscription_doc, subscription)
+            batch.set(order_doc, updated_order)
+            batch.set(payment_doc, payment_record)
+            batch.delete(pending_doc)
+            batch.commit()
+
+        await asyncio.to_thread(commit_records)
+
+    _COUNTRY_SUBSCRIPTION_CACHE[user_key] = subscription
+    _COUNTRY_ORDER_CACHE[order_id] = updated_order
+    _COUNTRY_PENDING_ORDER_CACHE.pop(user_key, None)
+    _COUNTRY_PROCESSED_PAYMENT_CACHE.add(charge_id)
+
+
+
+def _country_terms_text(price=None):
+    price_line = (
+        f"السعر: {price} ⭐ كل 30 يومًا.\n"
+        if isinstance(price, int) and price > 0 else "السعر المدفوع إن فُعّل سيظهر قبل الدفع.\n"
+    )
+    return (
+        "شروط كشف دولة الحساب الأصلية\n\n"
+        "الاشتراك خدمة رقمية شهرية تُحصّل عبر Telegram Stars، ومدته 30 يومًا "
+        "ويتجدد تلقائيًا كل 30 يومًا ما لم توقف التجديد. يبقى الوصول متاحًا حتى "
+        "نهاية الفترة المدفوعة.\n"
+        + price_line
+        + "بيانات الدولة مصدرها FinTok وقد لا تكون دقيقة أو مؤكدة. "
+        "اضغط «أوافق على الشروط وأتابع» للمتابعة إلى رابط الدفع.\n"
+        "إدارة التجديد: /subscription و /cancel_subscription. للدعم: /support."
+    )
+
+
+def _country_terms_markup(lookup_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "أوافق على الشروط وأتابع", callback_data=f"country_agree:{lookup_id}"
+    ))
+    return markup
+
+
+def _country_invoice_markup(invoice_link, price):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        f"اشتراك شهري — {price} ⭐", url=invoice_link
+    ))
+    return markup
+
+
+def _country_delivery_chat_id(call, user_id):
+    chat = getattr(call, "message", None)
+    chat = getattr(chat, "chat", None)
+    return chat.id if getattr(chat, "type", None) == "private" else user_id
+
+
+async def _send_original_country_photo(chat_id, lookup):
+    country = str(lookup.get("country") or "").strip()
+    if not country:
+        return False
+    caption = f"دولة الحساب الأصلية بحسب FinTok:\n{country}"
+    flag_url = _country_flag_png_url(country)
+    if flag_url:
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=flag_url, caption=caption)
+            return True
+        except Exception as exc:
+            print(f"Country flag PNG delivery failed: {type(exc).__name__}", flush=True)
+    await bot.send_message(
+        chat_id=chat_id,
+        text=caption + "\nتعذر تحديد رمز ISO لعرض صورة العلم.",
+    )
+    return False
+
+
+async def _create_or_reuse_country_order(user_id, lookup, price):
+    async with _COUNTRY_ORDER_LOCK:
+        pending = await _get_pending_country_order(user_id)
+        if pending:
+            order_id, order = pending
+            if order.get("amount") == price and order.get("currency") == "XTR":
+                order.update({
+                    "requested_lookup_id": lookup.get("lookup_id") or "",
+                    "requested_country": lookup.get("country", ""),
+                    "username": lookup.get("username", ""),
+                })
+                await _store_country_order(order_id, order)
+                return order_id, order
+            await _update_country_order(order_id, {"status": "price_changed"})
+            await _clear_pending_country_order(user_id)
+
+        order_id = secrets.token_urlsafe(16)
+        order = {
+            "user_id": user_id,
+            "currency": "XTR",
+            "amount": int(price),
+            "status": "pending",
+            "created_at": time.time(),
+            "expires_at": time.time() + _COUNTRY_ORDER_TTL_SECONDS,
+            "terms_accepted_at": time.time(),
+            "requested_lookup_id": lookup.get("lookup_id") or "",
+            "requested_country": lookup.get("country", ""),
+            "username": lookup.get("username", ""),
+        }
+        await _store_country_order(order_id, order)
+        await _set_pending_country_order(user_id, order_id)
+        if not order.get("invoice_link"):
+            order["invoice_link"] = await bot.create_invoice_link(
+                title="اشتراك كشف دولة الحساب الأصلية",
+                description="اشتراك رقمي متجدد كل 30 يومًا لكشف دولة الحساب الأصلية في نتائج البحث.",
+                payload=order_id,
+                provider_token="",
+                currency="XTR",
+                prices=[types.LabeledPrice(label="اشتراك كشف الدولة لمدة شهر", amount=int(price))],
+                subscription_period=_COUNTRY_SUBSCRIPTION_PERIOD_SECONDS,
+            )
+            await _store_country_order(order_id, order)
+        return order_id, order
+
+
+async def _send_country_invoice_link(user_id, order_id, order):
+    invoice_link = order.get("invoice_link")
+    if not invoice_link:
+        invoice_link = await bot.create_invoice_link(
+            title="اشتراك كشف دولة الحساب الأصلية",
+            description="اشتراك رقمي متجدد كل 30 يومًا لكشف دولة الحساب الأصلية في نتائج البحث.",
+            payload=order_id,
+            provider_token="",
+            currency="XTR",
+            prices=[types.LabeledPrice(
+                label="اشتراك كشف الدولة لمدة شهر", amount=int(order["amount"])
+            )],
+            subscription_period=_COUNTRY_SUBSCRIPTION_PERIOD_SECONDS,
+        )
+        order["invoice_link"] = invoice_link
+        await _store_country_order(order_id, order)
+    await bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"وافقْت على الشروط. رابط الاشتراك الشهري: {order['amount']} ⭐ كل 30 يومًا. "
+            "لا يتم تفعيل الوصول إلا بعد تأكيد Telegram للدفع. "
+            "يمكنك إيقاف التجديد عبر /cancel_subscription."
+        ),
+        reply_markup=_country_invoice_markup(invoice_link, order["amount"]),
+    )
 
 
 def _country_admin_panel_text(settings):
     if settings.get("mode") == "paid":
-        current = f"مدفوع — {settings.get('stars_price', 0)} ⭐ لكل كشف"
+        current = f"مدفوع — {settings.get('stars_price', 0)} ⭐ شهريًا، يتجدد كل 30 يومًا"
     else:
         price = settings.get("stars_price", 0)
-        current = "مجاني" + (f" (السعر المحفوظ: {price} ⭐)" if price else "")
-    return "لوحة دولة الحساب الأصلية\nالوضع الحالي: " + current + "\n\nاختر الوضع أو حدّد السعر."
+        current = "مجاني" + (f" (السعر المحفوظ: {price} ⭐ شهريًا)" if price else "")
+    return (
+        "لوحة دولة الحساب الأصلية\nالوضع الحالي: " + current
+        + "\n\nاختر المجاني أو المدفوع، ثم حدّد سعرًا شهريًا من 1 إلى 10,000 نجمة."
+    )
 
 
 def _parse_proxy_source_line(raw_line: str):
