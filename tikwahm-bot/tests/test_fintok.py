@@ -59,7 +59,7 @@ class FinTokFormattingTests(unittest.TestCase):
             "1.23K", "56.79K", "987.65K", "9007199254740993", "عام (Public Account)",
             "الولايات المتحدة — United States 🇺🇸 — المصدر: FinTok",
             "كندا — Canada 🇨🇦 — المصدر: FinTok",
-            "en-US", "03/07/2021, 04:05:06 PM", "11/29/2024, 09:08:07 AM",
+            "الإنجليزية (en-US)", "03/07/2021, 04:05:06 PM", "11/29/2024, 09:08:07 AM",
             "Google, Facebook", "نعم", "لا",
         ):
             self.assertIn(value, combined)

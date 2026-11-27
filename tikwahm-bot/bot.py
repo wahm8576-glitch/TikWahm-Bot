@@ -463,6 +463,35 @@ def _fintok_region(value):
     return value
 
 
+def _fintok_account_type(value):
+    if isinstance(value, bool):
+        return "خاص (Private Account)" if value else "عام (Public Account)"
+    if isinstance(value, (int, float)) and value in (0, 1):
+        return "خاص (Private Account)" if value == 1 else "عام (Public Account)"
+    if isinstance(value, str):
+        key = value.strip().casefold()
+        if key in {"private account", "private", "true"}:
+            return f"خاص ({value})" if key != "private account" else "خاص (Private Account)"
+        if key in {"public account", "public", "false"}:
+            return f"عام ({value})" if key != "public account" else "عام (Public Account)"
+    return value
+
+
+def _fintok_language(value):
+    if not isinstance(value, str) or not value.strip():
+        return value
+    value = value.strip()
+    name_to_code = {
+        "arabic": "ar", "english": "en", "italian": "it", "french": "fr",
+        "turkish": "tr", "spanish": "es", "german": "de", "japanese": "ja",
+        "korean": "ko", "chinese": "zh",
+    }
+    key = value.casefold()
+    code = name_to_code.get(key) or (key[:2] if re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", key) else "")
+    arabic_name = LANGUAGES_AR.get(code)
+    return f"{arabic_name} ({value})" if arabic_name else value
+
+
 def format_fintok_result(username, profile, active_region, registered_region, security):
     """Preserve the labels, values and order displayed by FinTok's profile page."""
     profile = profile if isinstance(profile, dict) else {}
@@ -474,15 +503,12 @@ def format_fintok_result(username, profile, active_region, registered_region, se
     basic = [("يتابع", _fintok_display_value(profile.get("following"), compact_number=True)),
              ("المتابعون", _fintok_display_value(profile.get("followers"), compact_number=True)),
              ("الإعجابات", _fintok_display_value(profile.get("likes"), compact_number=True))]
-    private = profile.get("private")
-    account_type = (
-        ("خاص (Private Account)" if private else "عام (Public Account)")
-        if isinstance(private, bool) else private
-    )
-    info = [("معرّف المستخدم", profile.get("userid")), ("نوع الحساب", account_type),
+    info = [("معرّف المستخدم", profile.get("userid")),
+            ("نوع الحساب", _fintok_account_type(profile.get("private"))),
             ("المنطقة النشطة", _fintok_region(active_region)),
             ("منطقة التسجيل", _fintok_region(registered_region)),
-            ("اللغة", profile.get("language")), ("وقت إنشاء الحساب", profile.get("created_time")),
+            ("اللغة", _fintok_language(profile.get("language"))),
+            ("وقت إنشاء الحساب", profile.get("created_time")),
             ("آخر تغيير للاسم", profile.get("last_change_name"))]
     platforms = oauth.get("platforms")
     if isinstance(platforms, list):

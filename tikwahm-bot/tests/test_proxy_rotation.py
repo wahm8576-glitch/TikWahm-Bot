@@ -211,6 +211,7 @@ class FinTokRequestTests(unittest.TestCase):
         self.assertIn("نوع الحساب | عام (Public Account)", result["text"])
         self.assertIn("المنطقة النشطة | إيطاليا — Italy 🇮🇹 — المصدر: FinTok", result["text"])
         self.assertIn("منطقة التسجيل | المملكة العربية السعودية — Saudi Arabia 🇸🇦 — المصدر: FinTok", result["text"])
+        self.assertIn("اللغة | العربية (Arabic)", result["text"])
         self.assertIn("البريد الإلكتروني مرتبط | نعم", result["text"])
         self.assertIn("حالة تسجيل الدخول | لا", result["text"])
         ordered_labels = ["يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
