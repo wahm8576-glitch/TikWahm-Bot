@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import os
 import re
 import secrets
@@ -49,6 +50,7 @@ FINTOK_SIGNATURE_SALT = "x2x7x1x90x79x24x001x"
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
+USER_SEARCH_COOLDOWN_SECONDS = 15
 # Query FinTok's JSON endpoints directly; a short per-proxy timeout keeps lookups responsive.
 SOURCE_TIMEOUT_SECONDS = 8
 MAX_SOURCE_RESPONSE_BYTES = 1_000_000
@@ -59,6 +61,8 @@ PROGRESS_ATTACHMENT_NAME = "loading_animation"
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
+_USER_SEARCH_LAST_AT = OrderedDict()
+_USER_SEARCH_COOLDOWN_LOCK = asyncio.Lock()
 _SEEN_WEBHOOK_UPDATE_IDS = OrderedDict()
 _WEBHOOK_UPDATE_ID_CACHE_LIMIT = 4096
 _SOURCE_SEMAPHORE = asyncio.Semaphore(3)
@@ -922,6 +926,15 @@ def _progress_message(username: str, percent: int, headline: str = "") -> str:
     return f"{title}\n\n{bar} {_arabic_digits(percent)}٪"
 
 
+def _wait_progress_for_elapsed(username: str, elapsed: float) -> str:
+    if elapsed < EXPECTED_LOOKUP_SECONDS:
+        percent = int(max(0, elapsed) / EXPECTED_LOOKUP_SECONDS * 100)
+        return _progress_message(username, percent)
+    frames = ("◴", "◷", "◶", "◵")
+    frame = frames[int(elapsed / PROGRESS_ANIMATION_INTERVAL) % len(frames)]
+    return _progress_message(username, 100, f"{frame} جارٍ إكمال البحث")
+
+
 def _progress_rich_message(text: str, media_source: str) -> types.InputRichMessage:
     """Build a Rich Message with an auto-playing animation and its progress text."""
     caption = "<br>".join(html.escape(line) for line in str(text).splitlines())
@@ -998,6 +1011,33 @@ def _prune_lookup_cache():
     expired = [key for key, (expires_at, _) in _LOOKUP_CACHE.items() if expires_at <= now]
     for key in expired:
         _LOOKUP_CACHE.pop(key, None)
+
+
+async def _reserve_user_search(user_id, now=None):
+    """Reserve one search slot per Telegram user for each 15-second window."""
+    if user_id is None:
+        return 0
+    key = str(user_id)
+    now = time.monotonic() if now is None else now
+    async with _USER_SEARCH_COOLDOWN_LOCK:
+        last_started = _USER_SEARCH_LAST_AT.get(key)
+        if last_started is not None:
+            remaining = USER_SEARCH_COOLDOWN_SECONDS - (now - last_started)
+            if remaining > 0:
+                _USER_SEARCH_LAST_AT.move_to_end(key)
+                return max(1, math.ceil(remaining))
+        _USER_SEARCH_LAST_AT[key] = now
+        _USER_SEARCH_LAST_AT.move_to_end(key)
+        if len(_USER_SEARCH_LAST_AT) > 10_000:
+            _USER_SEARCH_LAST_AT.popitem(last=False)
+        return 0
+
+
+def _search_cooldown_text(remaining: int) -> str:
+    return (
+        f"مهلًا، يُسمح ببحث واحد كل {_arabic_digits(USER_SEARCH_COOLDOWN_SECONDS)} ثانية. "
+        f"حاول بعد {_arabic_digits(remaining)} ثانية."
+    )
 
 
 async def _lookup_and_cache(username: str):
@@ -1162,11 +1202,7 @@ async def _wait_for_visible_result(username, wait_msg, chat_id, is_animation, ta
 
         elapsed = time.monotonic() - started
         if elapsed >= MAX_LOOKUP_SECONDS:
-            final_delay_message = _progress_message(
-                username,
-                100,
-                "⚠️ حصل بعض التأخير، ثانية من فضلك",
-            )
+            final_delay_message = _wait_progress_for_elapsed(username, elapsed)
             try:
                 await _edit_wait_message(
                     chat_id, wait_msg, is_animation, final_delay_message
@@ -1177,19 +1213,7 @@ async def _wait_for_visible_result(username, wait_msg, chat_id, is_animation, ta
             await _show_timeout(wait_msg, chat_id, username, is_animation)
             return False
 
-        if elapsed < EXPECTED_LOOKUP_SECONDS:
-            percent = int(elapsed / EXPECTED_LOOKUP_SECONDS * 100)
-            text = _progress_message(username, percent)
-        elif elapsed < EXPECTED_LOOKUP_SECONDS + PROGRESS_ANIMATION_INTERVAL:
-            text = _progress_message(username, 100)
-        else:
-            delay_elapsed = elapsed - EXPECTED_LOOKUP_SECONDS
-            percent = int(delay_elapsed / (MAX_LOOKUP_SECONDS - EXPECTED_LOOKUP_SECONDS) * 100)
-            text = _progress_message(
-                username,
-                percent,
-                "⚠️ حصل بعض التأخير، ثانية من فضلك",
-            )
+        text = _wait_progress_for_elapsed(username, elapsed)
         try:
             await _edit_wait_message(chat_id, wait_msg, is_animation, text)
         except Exception:
@@ -1273,6 +1297,14 @@ async def handle_username_message(message):
         )
         return
 
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if user_id is None:
+        user_id = f"chat:{message.chat.id}"
+    cooldown = await _reserve_user_search(user_id)
+    if cooldown:
+        await bot.reply_to(message, _search_cooldown_text(cooldown))
+        return
+
     wait_msg, is_animation = await _send_wait_message(message, username)
     cached_result, task, is_cached = _get_or_start_lookup(username)
     if is_cached:
@@ -1297,6 +1329,16 @@ async def retry_lookup_callback(call):
     retry_key = f"{chat_id}:{username.casefold()}"
     if retry_key in _RETRY_IN_PROGRESS:
         await bot.answer_callback_query(call.id, text="جارٍ استرجاع النتيجة الآن.")
+        return
+
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if user_id is None:
+        user_id = f"chat:{chat_id}"
+    cooldown = await _reserve_user_search(user_id)
+    if cooldown:
+        await bot.answer_callback_query(
+            call.id, text=_search_cooldown_text(cooldown)
+        )
         return
 
     _RETRY_IN_PROGRESS.add(retry_key)
