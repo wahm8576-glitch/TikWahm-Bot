@@ -47,6 +47,11 @@ ADMIN_PANEL_COMMAND = os.environ.pop("TIKWAHM_COUNTRY_ADMIN_COMMAND", "").strip(
 WEBHOOK_PATH = "/telegram/webhook"
 FINTOK_URL = "https://fintok.neocities.org/"
 FINTOK_API_URL = "https://tiktokinfov10.itfreeforever.workers.dev"
+BRIDGLY_FOLLOWERS_URL = "https://api.bridgly.app/tiktok/get-user-followers"
+BRIDGLY_API_KEY = os.environ.get("BRIDGLY_API_KEY", "").strip()
+FOLLOWERS_CACHE_TTL_SECONDS = 10 * 60
+FOLLOWERS_REQUEST_TIMEOUT_SECONDS = 8
+MAX_FOLLOWER_NAMES = 5
 # Public client-side request salt from FinTok's own JavaScript; not a credential.
 FINTOK_SIGNATURE_SALT = "x2x7x1x90x79x24x001x"
 MAX_LOOKUP_SECONDS = 15
@@ -63,6 +68,9 @@ PROGRESS_ATTACHMENT_NAME = "loading_animation"
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
+_FOLLOWERS_CACHE = OrderedDict()
+_FOLLOWERS_TASKS = {}
+_FOLLOWERS_LOCK = asyncio.Lock()
 _COUNTRY_LOOKUP_CACHE = {}
 _COUNTRY_ORDER_CACHE = {}
 _COUNTRY_SUBSCRIPTION_CACHE = {}
@@ -1370,14 +1378,17 @@ async def _deliver_result(chat_id, wait_msg, is_animation: bool, result):
             rich_message = types.InputRichMessage(markdown=result["markdown"], is_rtl=True)
             reply_markup = None
             original_country = result.get("original_country")
-            if original_country:
+            username = result.get("username", "")
+            if original_country or username:
                 try:
                     lookup_id = await _store_country_lookup(
-                        result.get("username", ""), original_country
+                        username, original_country or ""
                     )
-                    reply_markup = _country_button_markup(lookup_id)
+                    reply_markup = _country_button_markup(
+                        lookup_id, include_country=bool(original_country)
+                    )
                 except Exception as exc:
-                    print(f"Country button setup failed: {type(exc).__name__}", flush=True)
+                    print(f"Result buttons setup failed: {type(exc).__name__}", flush=True)
             await bot.send_rich_message(
                 chat_id=chat_id,
                 rich_message=rich_message,
@@ -1655,6 +1666,39 @@ async def country_button_callback(call):
         text=_country_terms_text(price),
         reply_markup=_country_terms_markup(lookup_id),
     )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("followers:")))
+async def followers_button_callback(call):
+    lookup_id = (call.data or "").removeprefix("followers:")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", lookup_id):
+        await bot.answer_callback_query(call.id, text="تعذر قراءة بيانات القائمة.", show_alert=True)
+        return
+    lookup = await _get_country_lookup(lookup_id)
+    if not lookup or not lookup.get("username"):
+        await bot.answer_callback_query(
+            call.id, text="انتهت صلاحية هذا الزر. أعد البحث عن الحساب.", show_alert=True
+        )
+        return
+    if not BRIDGLY_API_KEY:
+        await bot.answer_callback_query(
+            call.id, text="خدمة قائمة المتابعين غير مهيأة حاليًا.", show_alert=True
+        )
+        return
+
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if user_id is None:
+        await bot.answer_callback_query(call.id, text="تعذر تحديد المستخدم.", show_alert=True)
+        return
+    await bot.answer_callback_query(call.id, text="جارٍ جلب القائمة من المصدر…")
+    destination = _country_delivery_chat_id(call, user_id)
+    try:
+        followers = await _get_bridgly_followers(lookup["username"])
+        text = _format_followers_message(lookup["username"], followers)
+    except Exception as exc:
+        print(f"Bridgly follower lookup failed: {type(exc).__name__}", flush=True)
+        text = "تعذر جلب قائمة المتابعين حاليًا. حاول مرة أخرى لاحقًا."
+    await bot.send_message(chat_id=destination, text=text)
 
 
 @bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("country_agree:")))
@@ -2033,10 +2077,14 @@ _MAX_COUNTRY_STARS_PRICE = 10_000
 _COUNTRY_SUBSCRIPTION_PERIOD_SECONDS = 2_592_000
 
 
-def _country_button_markup(lookup_id):
+def _country_button_markup(lookup_id, include_country=True):
     markup = types.InlineKeyboardMarkup()
+    if include_country:
+        markup.add(types.InlineKeyboardButton(
+            "دولة الحساب الأصلية", callback_data=f"country:{lookup_id}"
+        ))
     markup.add(types.InlineKeyboardButton(
-        "دولة الحساب الأصلية", callback_data=f"country:{lookup_id}"
+        "قائمة المتابعين", callback_data=f"followers:{lookup_id}"
     ))
     return markup
 
@@ -2086,6 +2134,141 @@ async def _get_country_lookup(lookup_id):
         _COUNTRY_LOOKUP_CACHE.pop(lookup_id, None)
         return None
     return dict(record)
+
+
+class _BridglyConfigurationError(Exception):
+    """The follower provider has no configured credential."""
+
+
+class _BridglyRequestError(Exception):
+    """The provider returned an unusable or unsuccessful follower response."""
+
+
+def _request_bridgly_followers(username):
+    if not BRIDGLY_API_KEY:
+        raise _BridglyConfigurationError("Bridgly API key is not configured")
+    payload = json.dumps({
+        "uniqueId": str(username or "").lstrip("@")[:24],
+        "count": MAX_FOLLOWER_NAMES,
+    }).encode("utf-8")
+    request = urllib.request.Request(
+        BRIDGLY_FOLLOWERS_URL,
+        data=payload,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {BRIDGLY_API_KEY}",
+            "User-Agent": "TikWahm/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(
+            request, timeout=FOLLOWERS_REQUEST_TIMEOUT_SECONDS
+        ) as response:
+            status = response.getcode()
+            raw_body = response.read(MAX_SOURCE_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        raise _BridglyRequestError(f"Bridgly HTTP {exc.code}") from None
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise _BridglyRequestError(type(exc).__name__) from None
+
+    if not isinstance(status, int) or status < 200 or status >= 300:
+        raise _BridglyRequestError(f"Bridgly HTTP {status}")
+    if len(raw_body) > MAX_SOURCE_RESPONSE_BYTES:
+        raise _BridglyRequestError("Bridgly returned an oversized response")
+    try:
+        response_payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _BridglyRequestError(type(exc).__name__) from None
+    data = response_payload.get("data") if isinstance(response_payload, dict) else None
+    raw_users = data.get("users") if isinstance(data, dict) else None
+    if not isinstance(raw_users, list):
+        raise _BridglyRequestError("Bridgly response has no users list")
+
+    users = []
+    seen = set()
+    for user in raw_users:
+        if not isinstance(user, dict):
+            continue
+        handle = str(
+            user.get("uniqueId") or user.get("username") or user.get("unique_id") or ""
+        ).strip().lstrip("@")
+        nickname = str(
+            user.get("nickname") or user.get("displayName") or user.get("display_name") or ""
+        ).strip()
+        handle = re.sub(r"\s+", " ", handle)[:64]
+        nickname = re.sub(r"\s+", " ", nickname)[:100]
+        identity = (handle or nickname).casefold()
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        users.append({"handle": handle, "nickname": nickname})
+        if len(users) >= MAX_FOLLOWER_NAMES:
+            break
+    return users
+
+
+async def _get_bridgly_followers(username):
+    normalized = str(username or "").strip().lstrip("@")[:24]
+    if not normalized:
+        raise _BridglyRequestError("Missing TikTok username")
+    if not BRIDGLY_API_KEY:
+        raise _BridglyConfigurationError("Bridgly API key is not configured")
+    cache_key = normalized.casefold()
+    now = time.time()
+    cached = _FOLLOWERS_CACHE.get(cache_key)
+    if isinstance(cached, dict) and cached.get("expires_at", 0) > now:
+        _FOLLOWERS_CACHE.move_to_end(cache_key)
+        return [dict(user) for user in cached.get("users", [])]
+
+    async with _FOLLOWERS_LOCK:
+        cached = _FOLLOWERS_CACHE.get(cache_key)
+        if isinstance(cached, dict) and cached.get("expires_at", 0) > time.time():
+            _FOLLOWERS_CACHE.move_to_end(cache_key)
+            return [dict(user) for user in cached.get("users", [])]
+        task = _FOLLOWERS_TASKS.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                asyncio.to_thread(_request_bridgly_followers, normalized)
+            )
+            _FOLLOWERS_TASKS[cache_key] = task
+
+    try:
+        users = await asyncio.shield(task)
+    finally:
+        if task.done():
+            async with _FOLLOWERS_LOCK:
+                if _FOLLOWERS_TASKS.get(cache_key) is task:
+                    _FOLLOWERS_TASKS.pop(cache_key, None)
+
+    async with _FOLLOWERS_LOCK:
+        _FOLLOWERS_CACHE[cache_key] = {
+            "users": [dict(user) for user in users],
+            "expires_at": time.time() + FOLLOWERS_CACHE_TTL_SECONDS,
+        }
+        _FOLLOWERS_CACHE.move_to_end(cache_key)
+        while len(_FOLLOWERS_CACHE) > 1000:
+            _FOLLOWERS_CACHE.popitem(last=False)
+    return [dict(user) for user in users]
+
+
+def _format_followers_message(username, users):
+    lines = [f"قائمة المتابعين للحساب @{str(username or '').lstrip('@')}"]
+    if users:
+        for user in users[:MAX_FOLLOWER_NAMES]:
+            handle = str(user.get("handle") or "").strip().lstrip("@")
+            nickname = str(user.get("nickname") or "").strip()
+            if handle and nickname:
+                lines.append(f"• @{handle} — {nickname}")
+            elif handle:
+                lines.append(f"• @{handle}")
+            elif nickname:
+                lines.append(f"• {nickname}")
+    if len(lines) == 1:
+        lines.append("لم يُعد المصدر أسماءً للمتابعين لهذا الحساب.")
+    lines.append("ترتيب القائمة بحسب المصدر غير موثّق.")
+    return "\n".join(lines)
 
 
 async def _get_country_access_settings():

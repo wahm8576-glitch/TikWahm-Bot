@@ -214,14 +214,35 @@ class SearchControlsTests(unittest.TestCase):
             self.arun(bot._deliver_result(123, wait_message, "rich", result))
 
         markup = send_rich.await_args.kwargs["reply_markup"]
-        button = markup.keyboard[0][0]
-        self.assertEqual(button.text, "دولة الحساب الأصلية")
-        self.assertTrue(button.callback_data.startswith("country:"))
-        lookup_id = button.callback_data.removeprefix("country:")
+        country_button = markup.keyboard[0][0]
+        followers_button = markup.keyboard[1][0]
+        self.assertEqual(country_button.text, "دولة الحساب الأصلية")
+        self.assertTrue(country_button.callback_data.startswith("country:"))
+        self.assertEqual(followers_button.text, "قائمة المتابعين")
+        self.assertTrue(followers_button.callback_data.startswith("followers:"))
+        lookup_id = country_button.callback_data.removeprefix("country:")
+        self.assertEqual(followers_button.callback_data, f"followers:{lookup_id}")
         self.assertEqual(
             self.arun(bot._get_country_lookup(lookup_id))["country"],
             "كندا — Canada 🇨🇦 — المصدر: FinTok",
         )
+
+    def test_followers_button_is_kept_when_original_country_is_unavailable(self):
+        wait_message = SimpleNamespace(message_id=789)
+        result = {
+            "markdown": "**Display** · `@sample`\n| البيان | القيمة |",
+            "text": "Display",
+            "username": "sample",
+            "original_country": None,
+        }
+        with patch.object(bot.bot, "delete_message", new_callable=AsyncMock), \
+             patch.object(bot.bot, "send_rich_message", new_callable=AsyncMock) as send_rich:
+            self.arun(bot._deliver_result(123, wait_message, "rich", result))
+
+        markup = send_rich.await_args.kwargs["reply_markup"]
+        self.assertEqual(len(markup.keyboard), 1)
+        self.assertEqual(markup.keyboard[0][0].text, "قائمة المتابعين")
+        self.assertTrue(markup.keyboard[0][0].callback_data.startswith("followers:"))
 
     def test_country_name_resolves_to_a_real_png_flag_url(self):
         self.assertEqual(
