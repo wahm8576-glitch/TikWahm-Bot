@@ -25,7 +25,6 @@ class SearchControlsTests(unittest.TestCase):
             "settings": bot._COUNTRY_ACCESS_SETTINGS_CACHE,
             "order_lock": bot._COUNTRY_ORDER_LOCK,
             "payment_lock": bot._COUNTRY_PAYMENT_LOCK,
-            "pending_searches": bot._PENDING_COOLDOWN_SEARCHES,
             "support_users": bot._SUPPORT_PENDING_USER_IDS,
             "admin_user_id": bot._ADMIN_USER_ID,
             "admin_pending_price": bot._ADMIN_PENDING_PRICE_USER_ID,
@@ -43,7 +42,6 @@ class SearchControlsTests(unittest.TestCase):
         bot._COUNTRY_ACCESS_SETTINGS_CACHE = {"mode": "free", "stars_price": 0}
         bot._COUNTRY_ORDER_LOCK = asyncio.Lock()
         bot._COUNTRY_PAYMENT_LOCK = asyncio.Lock()
-        bot._PENDING_COOLDOWN_SEARCHES = {}
         bot._SUPPORT_PENDING_USER_IDS = set()
         bot._ADMIN_USER_ID = None
         bot._ADMIN_PENDING_PRICE_USER_ID = None
@@ -62,7 +60,6 @@ class SearchControlsTests(unittest.TestCase):
         bot._COUNTRY_ACCESS_SETTINGS_CACHE = self.saved["settings"]
         bot._COUNTRY_ORDER_LOCK = self.saved["order_lock"]
         bot._COUNTRY_PAYMENT_LOCK = self.saved["payment_lock"]
-        bot._PENDING_COOLDOWN_SEARCHES = self.saved["pending_searches"]
         bot._SUPPORT_PENDING_USER_IDS = self.saved["support_users"]
         bot._ADMIN_USER_ID = self.saved["admin_user_id"]
         bot._ADMIN_PENDING_PRICE_USER_ID = self.saved["admin_pending_price"]
@@ -143,22 +140,20 @@ class SearchControlsTests(unittest.TestCase):
         countdown.assert_awaited_once()
         self.assertEqual(countdown.await_args.args[0:3], (123, wait_message, "animation"))
 
-    def test_queued_username_is_started_automatically_after_countdown(self):
+    def test_cooldown_expiry_requires_manual_resubmission(self):
         message = SimpleNamespace(
             chat=SimpleNamespace(id=123), message_id=456,
             from_user=SimpleNamespace(id=101),
         )
         with patch.object(bot.bot, "send_animation", new_callable=AsyncMock) as send_gif, \
              patch.object(bot, "_run_search_cooldown_countdown", new_callable=AsyncMock) as countdown, \
-             patch.object(bot, "_reserve_user_search", new_callable=AsyncMock, return_value=0), \
              patch.object(bot, "_start_username_search", new_callable=AsyncMock) as start_search:
             send_gif.return_value = SimpleNamespace(message_id=789)
-            self.arun(bot._send_search_cooldown_message(message, 1, username="queued_user"))
+            self.arun(bot._send_search_cooldown_message(message, 1))
 
         countdown.assert_awaited_once()
-        self.assertIn("تلقائيًا", countdown.await_args.kwargs["completion_text"])
-        start_search.assert_awaited_once_with(message, "queued_user")
-        self.assertEqual(bot._PENDING_COOLDOWN_SEARCHES, {})
+        self.assertIn("أعد إرسال اسم المستخدم", countdown.await_args.kwargs["completion_text"])
+        start_search.assert_not_awaited()
 
     def test_countdown_edits_the_same_message_each_second_until_ready(self):
         class FakeClock:
@@ -565,6 +560,8 @@ class SearchControlsTests(unittest.TestCase):
         self.assertEqual(paid, {"mode": "paid", "stars_price": 29})
         self.assertEqual(free, {"mode": "free", "stars_price": 29})
         self.assertIn("شهريًا", bot._country_admin_panel_text(paid))
+        self.assertIn("مدة اشتراك Telegram Stars المتكرر ثابتة: 30 يومًا", bot._country_admin_panel_text(paid))
+        self.assertIn("لا يدعم Telegram تحديد مدة مخصصة", bot._country_admin_panel_text(paid))
         with self.assertRaises(ValueError):
             self.arun(bot._save_country_access_settings("paid", 0))
         with self.assertRaises(ValueError):

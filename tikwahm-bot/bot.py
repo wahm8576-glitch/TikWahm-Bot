@@ -71,7 +71,6 @@ _COUNTRY_PROCESSED_PAYMENT_CACHE = set()
 _COUNTRY_ACCESS_SETTINGS_CACHE = {"mode": "free", "stars_price": 0}
 _COUNTRY_ORDER_LOCK = asyncio.Lock()
 _COUNTRY_PAYMENT_LOCK = asyncio.Lock()
-_PENDING_COOLDOWN_SEARCHES = {}
 _SUPPORT_PENDING_USER_IDS = set()
 _ADMIN_USER_ID = None
 _ADMIN_PENDING_PRICE_USER_ID = None
@@ -1199,15 +1198,7 @@ async def _run_search_cooldown_countdown(
         pass
 
 
-async def _send_search_cooldown_message(message, remaining, username=None):
-    user_id = getattr(getattr(message, "from_user", None), "id", None)
-    queued_key = str(user_id) if username and user_id is not None else None
-    if queued_key and queued_key in _PENDING_COOLDOWN_SEARCHES:
-        _PENDING_COOLDOWN_SEARCHES[queued_key] = (message, username)
-        return
-    if queued_key:
-        _PENDING_COOLDOWN_SEARCHES[queued_key] = (message, username)
-
+async def _send_search_cooldown_message(message, remaining):
     deadline = time.monotonic() + remaining
     seconds = math.ceil(remaining)
     caption = _search_cooldown_text(seconds)
@@ -1224,34 +1215,14 @@ async def _send_search_cooldown_message(message, remaining, username=None):
         print(f"Cooldown animation fallback: {type(exc).__name__}", flush=True)
         wait_msg = await bot.reply_to(message, caption)
         is_animation = False
-
-    try:
-        while True:
-            await _run_search_cooldown_countdown(
-                message.chat.id,
-                wait_msg,
-                is_animation,
-                deadline,
-                initial_seconds=seconds,
-                completion_text=(
-                    "✅ انتهى الانتظار؛ سيبدأ البحث تلقائيًا."
-                    if queued_key else "✅ البحث متاح الآن، أرسل اسم المستخدم من جديد."
-                ),
-            )
-            if not queued_key:
-                return
-            reserved = await _reserve_user_search(user_id)
-            if not reserved:
-                queued = _PENDING_COOLDOWN_SEARCHES.pop(queued_key, None)
-                if queued:
-                    queued_message, queued_username = queued
-                    await _start_username_search(queued_message, queued_username)
-                return
-            deadline = time.monotonic() + reserved
-            seconds = reserved
-    finally:
-        if queued_key:
-            _PENDING_COOLDOWN_SEARCHES.pop(queued_key, None)
+    await _run_search_cooldown_countdown(
+        message.chat.id,
+        wait_msg,
+        is_animation,
+        deadline,
+        initial_seconds=seconds,
+        completion_text="✅ انتهى الانتظار؛ أعد إرسال اسم المستخدم لبدء البحث.",
+    )
 
 
 async def _start_username_search(message, username):
@@ -1940,7 +1911,7 @@ async def handle_username_message(message):
         user_id = f"chat:{message.chat.id}"
     cooldown = await _reserve_user_search(user_id)
     if cooldown:
-        await _send_search_cooldown_message(message, cooldown, username=username)
+        await _send_search_cooldown_message(message, cooldown)
         return
 
     await _start_username_search(message, username)
@@ -2369,8 +2340,9 @@ def _country_terms_text(price=None):
     )
     return (
         "شروط كشف دولة الحساب الأصلية\n\n"
-        "الاشتراك خدمة رقمية شهرية تُحصّل عبر Telegram Stars، ومدته 30 يومًا "
-        "ويتجدد تلقائيًا كل 30 يومًا ما لم توقف التجديد. يبقى الوصول متاحًا حتى "
+        "الاشتراك خدمة رقمية تُحصّل عبر Telegram Stars، ومدته الثابتة 30 يومًا "
+        "ويتجدد تلقائيًا كل 30 يومًا ما لم توقف التجديد. لا يدعم Telegram تغيير "
+        "مدة الاشتراك المتكرر إلى أيام أو ساعات أو دقائق. يبقى الوصول متاحًا حتى "
         "نهاية الفترة المدفوعة.\n"
         + price_line
         + "بيانات الدولة مصدرها FinTok وقد لا تكون دقيقة أو مؤكدة. "
@@ -2500,7 +2472,9 @@ def _country_admin_panel_text(settings):
         current = "مجاني" + (f" (السعر المحفوظ: {price} ⭐ شهريًا)" if price else "")
     return (
         "لوحة دولة الحساب الأصلية\nالوضع الحالي: " + current
-        + "\n\nاختر المجاني أو المدفوع، ثم حدّد سعرًا شهريًا من 1 إلى 10,000 نجمة."
+        + "\n\nمدة اشتراك Telegram Stars المتكرر ثابتة: 30 يومًا؛ لا يدعم Telegram "
+        "تحديد مدة مخصصة بالأيام أو الساعات أو الدقائق. "
+        "اختر المجاني أو المدفوع، ثم حدّد سعرًا شهريًا من 1 إلى 10,000 نجمة."
     )
 
 
