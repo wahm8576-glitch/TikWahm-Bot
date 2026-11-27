@@ -49,6 +49,11 @@ ADMIN_PANEL_COMMAND = os.environ.pop("TIKWAHM_COUNTRY_ADMIN_COMMAND", "").strip(
 WEBHOOK_PATH = "/telegram/webhook"
 FINTOK_URL = "https://fintok.neocities.org/"
 FINTOK_API_URL = "https://tiktokinfov10.itfreeforever.workers.dev"
+SOCIAL_SITE_ORIGINS = (
+    "https://fintok.pages.dev",
+    "https://tiktokinfo.indevs.in",
+    "https://fintok.neocities.org",
+)
 BRIDGLY_FOLLOWERS_URL = "https://api.bridgly.app/tiktok/get-user-followers"
 BRIDGLY_FOLLOWING_URL = "https://api.bridgly.app/tiktok/get-user-following"
 BRIDGLY_API_KEY = os.environ.get("BRIDGLY_API_KEY", "").strip()
@@ -84,6 +89,11 @@ _RETRY_IN_PROGRESS = set()
 _BRIDGLY_LIST_CACHE = OrderedDict()
 _BRIDGLY_LIST_TASKS = {}
 _BRIDGLY_LIST_LOCK = asyncio.Lock()
+_SOCIAL_SITE_INDEX = 0
+_SOCIAL_SITE_LOCK = asyncio.Lock()
+_SITE_LIST_CACHE = OrderedDict()
+_SITE_LIST_TASKS = {}
+_SITE_LIST_LOCK = asyncio.Lock()
 _COUNTRY_LOOKUP_CACHE = {}
 _COUNTRY_ORDER_CACHE = {}
 _COUNTRY_SUBSCRIPTION_CACHE = {}
@@ -986,7 +996,9 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
     if not isinstance(security, dict):
         raise _FinTokRequestRejected("FinTok returned an invalid security section")
     _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
-    return format_fintok_result(username, profile, active_region, registered_region, security)
+    result = format_fintok_result(username, profile, active_region, registered_region, security)
+    result["user_id"] = str(uid)
+    return result
 
 
 async def fetch_data_from_fintok(username: str, progress=None):
@@ -1394,9 +1406,13 @@ async def _deliver_result(chat_id, wait_msg, is_animation: bool, result):
             username = result.get("username", "")
             if original_country or username:
                 try:
-                    lookup_id = await _store_country_lookup(
-                        username, original_country or ""
-                    )
+                    user_id = str(result.get("user_id") or "")
+                    if re.fullmatch(r"[0-9]{1,32}", user_id):
+                        lookup_id = await _store_country_lookup(
+                            username, original_country or "", user_id
+                        )
+                    else:
+                        lookup_id = await _store_country_lookup(username, original_country or "")
                     reply_markup = _country_button_markup(
                         lookup_id, include_country=bool(original_country)
                     )
@@ -1693,12 +1709,6 @@ async def _bridgly_list_button_callback(call, list_kind):
             call.id, text="انتهت صلاحية هذا الزر. أعد البحث عن الحساب.", show_alert=True
         )
         return
-    if not BRIDGLY_API_KEY:
-        await bot.answer_callback_query(
-            call.id, text="خدمة قوائم المتابعين غير مهيأة حاليًا.", show_alert=True
-        )
-        return
-
     user_id = getattr(getattr(call, "from_user", None), "id", None)
     if user_id is None:
         await bot.answer_callback_query(call.id, text="تعذر تحديد المستخدم.", show_alert=True)
@@ -1714,28 +1724,19 @@ async def _bridgly_list_button_callback(call, list_kind):
     )
     destination = _country_delivery_chat_id(call, user_id)
     try:
-        users = await _get_bridgly_social_list(
-            lookup["username"], list_kind, requested_count
+        users = await _get_site_social_list(
+            lookup["username"], list_kind, requested_count, lookup.get("user_id", "")
         )
-    except _BridglyPrivateAccountError:
-        text = (
-            "قائمة الحسابات التي يتابعها غير متاحة لأن حساب TikTok خاص."
-            if list_kind == "following"
-            else "قائمة المتابعين غير متاحة لأن حساب TikTok خاص."
-        )
-        await bot.send_message(chat_id=destination, text=text)
-        return
     except _BridglyRequestError as exc:
-        print(f"Bridgly {list_kind} lookup failed: {type(exc).__name__}", flush=True)
+        print(f"Website {list_kind} lookup failed: {type(exc).__name__}", flush=True)
         text = (
-            "تعذر جلب القائمة: لا يتوفر رصيد Bridgly مجاني حاليًا."
-            if exc.status == 402
-            else "تعذر جلب القائمة حاليًا. حاول مرة أخرى لاحقًا."
+            "القائمة غير متاحة حاليًا أو ليست ظاهرة للعامة. "
+            "تعذر تأكيد توفرها من المصادر المتاحة؛ حاول لاحقًا."
         )
         await bot.send_message(chat_id=destination, text=text)
         return
     except Exception as exc:
-        print(f"Bridgly {list_kind} lookup failed: {type(exc).__name__}", flush=True)
+        print(f"Website {list_kind} lookup failed: {type(exc).__name__}", flush=True)
         await bot.send_message(
             chat_id=destination, text="تعذر جلب القائمة حاليًا. حاول مرة أخرى لاحقًا."
         )
@@ -2180,7 +2181,7 @@ def _country_admin_markup():
     return markup
 
 
-async def _store_country_lookup(username, country):
+async def _store_country_lookup(username, country, user_id=""):
     lookup_id = secrets.token_urlsafe(12)
     record = {
         "username": str(username or "")[:64],
@@ -2188,6 +2189,8 @@ async def _store_country_lookup(username, country):
         "created_at": time.time(),
         "expires_at": time.time() + _COUNTRY_LOOKUP_TTL_SECONDS,
     }
+    if re.fullmatch(r"[0-9]{1,32}", str(user_id)):
+        record["user_id"] = str(user_id)
     _COUNTRY_LOOKUP_CACHE[lookup_id] = record
     if _FIRESTORE_CLIENT is not None:
         document = _FIRESTORE_CLIENT.collection("fintok_country_lookups").document(lookup_id)
@@ -2385,6 +2388,202 @@ async def _get_bridgly_social_list(username, list_kind, count=MAX_FOLLOWER_NAMES
         while len(_BRIDGLY_LIST_CACHE) > 1000:
             _BRIDGLY_LIST_CACHE.popitem(last=False)
     return [dict(user) for user in users]
+
+
+def _request_site_social_list(user_id, list_kind, count, proxy, origin):
+    """Fetch a real TikTok list using the public request made by the listed sites."""
+    if list_kind not in {"followers", "following"}:
+        raise ValueError("unknown social list kind")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_FOLLOWER_NAMES:
+        raise ValueError("invalid social list count")
+    uid = str(user_id or "")
+    if not re.fullmatch(r"[0-9]{1,32}", uid):
+        raise _BridglyRequestError("Invalid TikTok user ID")
+    parsed_origin = urlparse(origin)
+    if parsed_origin.scheme != "https" or parsed_origin.netloc not in {
+        urlparse(value).netloc for value in SOCIAL_SITE_ORIGINS
+    }:
+        raise _BridglyRequestError("Invalid social-list origin")
+
+    if proxy is None:
+        raise _BridglyRequestError("No configured proxy is available")
+    proxy_url = (
+        f"http://{quote(proxy['username'], safe='')}:{quote(proxy['password'], safe='')}"
+        f"@{proxy['host']}:{proxy['port']}"
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+    timestamp = int(time.time())
+    params = urlencode({"Uid": uid, "ts": timestamp, "minCursor": 0})
+    endpoint = f"{FINTOK_API_URL}/api/{list_kind}?{params}"
+    request = urllib.request.Request(
+        endpoint,
+        headers={
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "Cache-Control": "no-cache",
+            "Content-Type": "application/json",
+            "Origin": origin.rstrip("/"),
+            "Referer": origin.rstrip("/") + "/info/",
+            "User-Agent": "Mozilla/5.0 (compatible; TikWahm/1.0)",
+            "x-token": _fintok_signature(timestamp, uid),
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(request, timeout=SOURCE_TIMEOUT_SECONDS) as response:
+            status = response.getcode()
+            raw_body = response.read(MAX_SOURCE_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        status = exc.code
+        exc.close()
+        raise _BridglyRequestError(f"Social-list HTTP {status}", status=status) from None
+    except (urllib.error.URLError, socket.timeout, TimeoutError, OSError) as exc:
+        raise _BridglyRequestError(type(exc).__name__) from None
+
+    if not isinstance(status, int) or status < 200 or status >= 300:
+        raise _BridglyRequestError(f"Social-list HTTP {status}", status=status)
+    if len(raw_body) > MAX_SOURCE_RESPONSE_BYTES:
+        raise _BridglyRequestError("Social-list response is oversized")
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _BridglyRequestError(type(exc).__name__) from None
+    raw_users = payload.get("users") if isinstance(payload, dict) else None
+    if not isinstance(raw_users, list) or not raw_users:
+        raise _BridglyRequestError("Social-list response has no public users", status=status)
+
+    users = []
+    seen = set()
+    for user in raw_users:
+        if not isinstance(user, dict):
+            continue
+        handle = str(user.get("uniqueId") or "").strip().lstrip("@")
+        nickname = str(user.get("nickname") or "").strip()
+        avatar_url = str(user.get("avatarThumb") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9._]{1,64}", handle):
+            handle = ""
+        if not _is_allowed_tiktok_avatar_url(avatar_url):
+            avatar_url = ""
+        identity = (handle or nickname).casefold()
+        if not identity or identity in seen:
+            continue
+        seen.add(identity)
+        users.append({
+            "handle": handle,
+            "nickname": re.sub(r"\s+", " ", nickname)[:100],
+            "avatar_url": avatar_url,
+        })
+        if len(users) >= count:
+            break
+    if not users:
+        raise _BridglyRequestError("Social-list response contained no usable users", status=status)
+    return users
+
+
+async def _get_site_social_list(username, list_kind, count=MAX_FOLLOWER_NAMES, user_id=""):
+    """Fetch and cache a list, rotating among the three configured page origins."""
+    global _SOCIAL_SITE_INDEX
+    if list_kind not in {"followers", "following"}:
+        raise ValueError("unknown social list kind")
+    if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= MAX_FOLLOWER_NAMES:
+        raise ValueError("invalid social list count")
+    normalized = normalize_username(str(username or ""))
+    if not normalized:
+        raise _BridglyRequestError("Invalid TikTok username")
+
+    uid = str(user_id or "")
+    if not re.fullmatch(r"[0-9]{1,32}", uid):
+        cached_profile = _LOOKUP_CACHE.get(normalized.casefold())
+        cached_result = (
+            cached_profile[1]
+            if cached_profile and cached_profile[0] > time.monotonic()
+            else None
+        )
+        if isinstance(cached_result, dict):
+            uid = str(cached_result.get("user_id") or "")
+    if not re.fullmatch(r"[0-9]{1,32}", uid):
+        # Older lookup buttons have no stored UID. Resolve it using the same
+        # proxy-protected profile flow; never guess a numeric TikTok ID.
+        profile_result = await fetch_data_from_fintok(normalized)
+        uid = str(profile_result.get("user_id") or "") if isinstance(profile_result, dict) else ""
+    if not re.fullmatch(r"[0-9]{1,32}", uid):
+        raise _BridglyRequestError("Could not resolve TikTok user ID through configured proxies")
+
+    cache_key = f"{uid}:{list_kind}:{count}"
+    now = time.time()
+    cached = _SITE_LIST_CACHE.get(cache_key)
+    if isinstance(cached, dict) and cached.get("expires_at", 0) > now:
+        _SITE_LIST_CACHE.move_to_end(cache_key)
+        return [dict(user) for user in cached.get("users", [])]
+
+    async with _SITE_LIST_LOCK:
+        cached = _SITE_LIST_CACHE.get(cache_key)
+        if isinstance(cached, dict) and cached.get("expires_at", 0) > time.time():
+            _SITE_LIST_CACHE.move_to_end(cache_key)
+            return [dict(user) for user in cached.get("users", [])]
+        task = _SITE_LIST_TASKS.get(cache_key)
+        if task is None:
+            async with _SOCIAL_SITE_LOCK:
+                start_index = _SOCIAL_SITE_INDEX % len(SOCIAL_SITE_ORIGINS)
+                _SOCIAL_SITE_INDEX = (start_index + 1) % len(SOCIAL_SITE_ORIGINS)
+            task = asyncio.create_task(
+                _fetch_site_list_with_fallback(uid, list_kind, count, start_index)
+            )
+            _SITE_LIST_TASKS[cache_key] = task
+
+    try:
+        users = await asyncio.shield(task)
+    finally:
+        if task.done():
+            async with _SITE_LIST_LOCK:
+                if _SITE_LIST_TASKS.get(cache_key) is task:
+                    _SITE_LIST_TASKS.pop(cache_key, None)
+    async with _SITE_LIST_LOCK:
+        _SITE_LIST_CACHE[cache_key] = {
+            "users": [dict(user) for user in users],
+            "expires_at": time.time() + BRIDGLY_LIST_CACHE_TTL_SECONDS,
+        }
+        _SITE_LIST_CACHE.move_to_end(cache_key)
+        while len(_SITE_LIST_CACHE) > 1000:
+            _SITE_LIST_CACHE.popitem(last=False)
+    return [dict(user) for user in users]
+
+
+async def _fetch_site_list_with_fallback(user_id, list_kind, count, start_index):
+    if not _PROXY_POOL:
+        raise _BridglyRequestError("No configured proxy is available")
+    errors = []
+    # One bounded attempt per public page origin; each attempt consumes the
+    # next proxy slot, and the next request starts at the next origin.
+    for offset in range(len(SOCIAL_SITE_ORIGINS)):
+        origin = SOCIAL_SITE_ORIGINS[(start_index + offset) % len(SOCIAL_SITE_ORIGINS)]
+        proxy, proxy_index = await _get_next_proxy()
+        try:
+            async with _SOURCE_SEMAPHORE:
+                users = await asyncio.to_thread(
+                    _request_site_social_list, user_id, list_kind, count, proxy, origin
+                )
+            print(
+                f"Social-list {list_kind} succeeded via page source {offset + 1} "
+                f"and proxy slot #{proxy_index + 1}.", flush=True,
+            )
+            return users
+        except _BridglyRequestError as exc:
+            errors.append(exc.status or type(exc).__name__)
+            print(
+                f"Social-list {list_kind} source {offset + 1} failed via proxy "
+                f"slot #{proxy_index + 1}; rotating to next source.", flush=True,
+            )
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+            print(
+                f"Social-list {list_kind} source {offset + 1} encountered "
+                f"{type(exc).__name__}; rotating to next source.", flush=True,
+            )
+    raise _BridglyRequestError(
+        f"All social-list page sources failed ({', '.join(map(str, errors))})"
+    )
 
 
 async def _get_bridgly_followers(username, count=MAX_FOLLOWER_NAMES):

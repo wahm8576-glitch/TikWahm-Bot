@@ -32,6 +32,16 @@ class FakeResponse:
         return json.dumps(self.payload).encode("utf-8")
 
 
+class FakeOpener:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+
+    def open(self, request, timeout):
+        self.requests.append((request, timeout))
+        return self.response
+
+
 class BridglyListTests(unittest.TestCase):
     def setUp(self):
         self.saved = {
@@ -41,6 +51,10 @@ class BridglyListTests(unittest.TestCase):
             "lock": bot._BRIDGLY_LIST_LOCK,
             "avatar_cache": bot._AVATAR_THUMBNAIL_CACHE,
             "avatar_semaphore": bot._AVATAR_THUMBNAIL_SEMAPHORE,
+            "site_cache": bot._SITE_LIST_CACHE,
+            "site_tasks": bot._SITE_LIST_TASKS,
+            "site_lock": bot._SITE_LIST_LOCK,
+            "site_index": bot._SOCIAL_SITE_INDEX,
         }
         bot.BRIDGLY_API_KEY = "unit-test-key-not-for-network"
         bot._BRIDGLY_LIST_CACHE = bot.OrderedDict()
@@ -48,6 +62,10 @@ class BridglyListTests(unittest.TestCase):
         bot._BRIDGLY_LIST_LOCK = asyncio.Lock()
         bot._AVATAR_THUMBNAIL_CACHE = bot.OrderedDict()
         bot._AVATAR_THUMBNAIL_SEMAPHORE = asyncio.Semaphore(3)
+        bot._SITE_LIST_CACHE = bot.OrderedDict()
+        bot._SITE_LIST_TASKS = {}
+        bot._SITE_LIST_LOCK = asyncio.Lock()
+        bot._SOCIAL_SITE_INDEX = 0
 
     def tearDown(self):
         bot.BRIDGLY_API_KEY = self.saved["api_key"]
@@ -56,6 +74,10 @@ class BridglyListTests(unittest.TestCase):
         bot._BRIDGLY_LIST_LOCK = self.saved["lock"]
         bot._AVATAR_THUMBNAIL_CACHE = self.saved["avatar_cache"]
         bot._AVATAR_THUMBNAIL_SEMAPHORE = self.saved["avatar_semaphore"]
+        bot._SITE_LIST_CACHE = self.saved["site_cache"]
+        bot._SITE_LIST_TASKS = self.saved["site_tasks"]
+        bot._SITE_LIST_LOCK = self.saved["site_lock"]
+        bot._SOCIAL_SITE_INDEX = self.saved["site_index"]
 
     @staticmethod
     def arun(awaitable):
@@ -361,7 +383,7 @@ class BridglyListTests(unittest.TestCase):
                 call = self.callback(list_kind=list_kind, callback_id=f"{list_kind}-callback")
                 with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": ""}), patch.object(
                     bot, "_get_country_lookup", new_callable=AsyncMock,
-                    return_value={"username": "menharef"},
+                    return_value={"username": "menharef", "user_id": "7090596962206893062"},
                 ), patch.object(
                     bot, "_get_country_access_settings", new_callable=AsyncMock,
                     return_value={"mode": "paid", "stars_price": 17},
@@ -369,7 +391,7 @@ class BridglyListTests(unittest.TestCase):
                     bot, "_has_active_country_subscription", new_callable=AsyncMock,
                     return_value=True,
                 ), patch.object(
-                    bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+                    bot, "_get_site_social_list", new_callable=AsyncMock,
                     return_value=users,
                 ) as fetch, patch.object(
                     bot, "_create_bridgly_list_image", new_callable=AsyncMock,
@@ -383,7 +405,9 @@ class BridglyListTests(unittest.TestCase):
                 ) as send_text:
                     self.arun(handler(call))
 
-                fetch.assert_awaited_once_with("menharef", list_kind, 13)
+                fetch.assert_awaited_once_with(
+                    "menharef", list_kind, 13, "7090596962206893062"
+                )
                 render_image.assert_awaited_once_with("menharef", users, list_kind, 0)
                 self.assertIsInstance(send_photo.await_args.kwargs["photo"], bot.types.InputFile)
                 self.assertIsNone(send_photo.await_args.kwargs["reply_markup"])
@@ -394,7 +418,7 @@ class BridglyListTests(unittest.TestCase):
         users = self.sample_users("free")[:3]
         with patch.object(
             bot, "_get_country_lookup", new_callable=AsyncMock,
-            return_value={"username": "menharef"},
+            return_value={"username": "menharef", "user_id": "7090596962206893062"},
         ), patch.object(
             bot, "_get_country_access_settings", new_callable=AsyncMock,
             return_value={"mode": "paid", "stars_price": 31},
@@ -402,7 +426,7 @@ class BridglyListTests(unittest.TestCase):
             bot, "_has_active_country_subscription", new_callable=AsyncMock,
             return_value=False,
         ), patch.object(
-            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            bot, "_get_site_social_list", new_callable=AsyncMock,
             return_value=users,
         ) as fetch, patch.object(
             bot, "_create_bridgly_list_image", new_callable=AsyncMock,
@@ -414,7 +438,9 @@ class BridglyListTests(unittest.TestCase):
         ) as send_photo:
             self.arun(bot.followers_button_callback(call))
 
-        fetch.assert_awaited_once_with("menharef", "followers", 3)
+        fetch.assert_awaited_once_with(
+            "menharef", "followers", 3, "7090596962206893062"
+        )
         render_image.assert_awaited_once_with("menharef", users, "followers", 10)
         markup = send_photo.await_args.kwargs["reply_markup"]
         self.assertEqual(markup.keyboard[0][0].callback_data, "country:lookup_12345678")
@@ -441,7 +467,7 @@ class BridglyListTests(unittest.TestCase):
             bot, "_get_country_lookup", new_callable=AsyncMock,
             return_value={"username": "menharef"},
         ), patch.object(
-            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            bot, "_get_site_social_list", new_callable=AsyncMock,
             return_value=users,
         ), patch.object(
             bot, "_create_bridgly_list_image", new_callable=AsyncMock,
@@ -463,12 +489,13 @@ class BridglyListTests(unittest.TestCase):
             bot, "_get_country_lookup", new_callable=AsyncMock,
             return_value={"username": "menharef"},
         ), patch.object(
-            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            bot, "_get_site_social_list", new_callable=AsyncMock,
             side_effect=bot._BridglyPrivateAccountError("private", status=403),
         ), patch.object(bot.bot, "answer_callback_query", new_callable=AsyncMock), \
              patch.object(bot.bot, "send_message", new_callable=AsyncMock) as send_message:
             self.arun(bot.following_button_callback(call))
-        self.assertIn("حساب TikTok خاص", send_message.await_args.kwargs["text"])
+        self.assertIn("ليست ظاهرة للعامة", send_message.await_args.kwargs["text"])
+        self.assertNotIn("حساب TikTok خاص", send_message.await_args.kwargs["text"])
 
     def test_callback_handles_out_of_credits_without_attempting_a_purchase(self):
         call = self.callback(list_kind="following", callback_id="following-no-credits")
@@ -476,28 +503,154 @@ class BridglyListTests(unittest.TestCase):
             bot, "_get_country_lookup", new_callable=AsyncMock,
             return_value={"username": "menharef"},
         ), patch.object(
-            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            bot, "_get_site_social_list", new_callable=AsyncMock,
             side_effect=bot._BridglyRequestError("credits exhausted", status=402),
         ), patch.object(bot.bot, "answer_callback_query", new_callable=AsyncMock), \
              patch.object(bot.bot, "send_message", new_callable=AsyncMock) as send_message:
             self.arun(bot.following_button_callback(call))
-        self.assertIn("لا يتوفر رصيد Bridgly مجاني", send_message.await_args.kwargs["text"])
+        self.assertIn("تعذر تأكيد توفرها", send_message.await_args.kwargs["text"])
 
-    def test_missing_key_callback_explains_feature_is_unavailable_without_fetching(self):
+    def test_missing_paid_provider_key_does_not_block_free_site_lists(self):
         bot.BRIDGLY_API_KEY = ""
         with patch.object(
             bot, "_get_country_lookup", new_callable=AsyncMock,
-            return_value={"username": "menharef"},
+            return_value={"username": "menharef", "user_id": "7090596962206893062"},
         ), patch.object(
-            bot, "_get_bridgly_social_list", new_callable=AsyncMock,
+            bot, "_get_site_social_list", new_callable=AsyncMock,
+            return_value=self.sample_users("free")[:3],
         ) as fetch, patch.object(
             bot.bot, "answer_callback_query", new_callable=AsyncMock,
-        ) as answer:
+        ), patch.object(
+            bot, "_create_bridgly_list_image", new_callable=AsyncMock,
+            return_value=b"free-list",
+        ), patch.object(
+            bot.bot, "send_photo", new_callable=AsyncMock,
+        ):
             self.arun(bot.following_button_callback(self.callback(list_kind="following")))
 
-        fetch.assert_not_awaited()
-        self.assertTrue(answer.await_args.kwargs["show_alert"])
-        self.assertIn("غير مهيأة", answer.await_args.kwargs["text"])
+        fetch.assert_awaited_once_with(
+            "menharef", "following", 13, "7090596962206893062"
+        )
+
+    def test_site_request_uses_signed_post_and_normalizes_real_users(self):
+        uid = "7090596962206893062"
+        response = FakeResponse({"users": [
+            {
+                "uniqueId": "7ioif", "nickname": "𝓐",
+                "avatarThumb": "https://p16-common-sign.tiktokcdn.com/avatar.webp",
+            },
+            {"uniqueId": "7ioif", "nickname": "duplicate", "avatarThumb": ""},
+        ]})
+        opener = FakeOpener(response)
+        proxy = {"host": "proxy.example", "port": 8080, "username": "u", "password": "p"}
+        with patch.object(bot.urllib.request, "build_opener", return_value=opener):
+            users = bot._request_site_social_list(
+                uid, "followers", 13, proxy, bot.SOCIAL_SITE_ORIGINS[0]
+            )
+
+        self.assertEqual(len(users), 1)
+        self.assertEqual(users[0]["handle"], "7ioif")
+        self.assertEqual(users[0]["nickname"], "𝓐")
+        self.assertTrue(users[0]["avatar_url"].endswith("avatar.webp"))
+        request, timeout = opener.requests[0]
+        from urllib.parse import parse_qs, urlparse
+        query = parse_qs(urlparse(request.full_url).query)
+        timestamp = query["ts"][0]
+        self.assertEqual(request.get_method(), "POST")
+        self.assertIsNone(request.data)
+        self.assertEqual(query, {"Uid": [uid], "ts": [timestamp], "minCursor": ["0"]})
+        self.assertEqual(request.get_header("X-token"), bot._fintok_signature(timestamp, uid))
+        self.assertEqual(request.get_header("Origin"), bot.SOCIAL_SITE_ORIGINS[0])
+        self.assertEqual(request.get_header("Content-type"), "application/json")
+        self.assertEqual(timeout, bot.SOURCE_TIMEOUT_SECONDS)
+
+    def test_site_fallback_cycles_origins_and_proxy_slots_in_bounded_attempts(self):
+        proxies = [
+            {"host": f"proxy{index}", "port": 8080, "username": "u", "password": "p"}
+            for index in range(3)
+        ]
+        users = self.sample_users("fallback")[:3]
+        seen = []
+
+        async def fake_to_thread(fn, *args):
+            seen.append((args[3], args[4]))
+            attempt = len(seen)
+            if attempt < 3:
+                raise bot._BridglyRequestError("temporary source failure")
+            return users
+
+        async def scenario(start_index):
+            with patch.object(bot, "_PROXY_POOL", proxies), patch.object(
+                bot, "_get_next_proxy", new_callable=AsyncMock,
+                side_effect=[(proxy, index) for index, proxy in enumerate(proxies)],
+            ), patch.object(bot.asyncio, "to_thread", new=fake_to_thread):
+                return await bot._fetch_site_list_with_fallback(
+                    "7090596962206893062", "followers", 3, start_index
+                )
+
+        result = self.arun(scenario(0))
+        self.assertEqual(result, users)
+        self.assertEqual([origin for _, origin in seen], list(bot.SOCIAL_SITE_ORIGINS))
+        self.assertEqual([proxy["host"] for proxy, _ in seen], ["proxy0", "proxy1", "proxy2"])
+
+    def test_site_fallback_wraps_origin_order_and_stops_after_three_failures(self):
+        proxies = [
+            {"host": f"proxy{index}", "port": 8080, "username": "u", "password": "p"}
+            for index in range(3)
+        ]
+        seen = []
+
+        async def fail_to_thread(fn, *args):
+            seen.append(args[4])
+            raise bot._BridglyRequestError("no users")
+
+        async def scenario():
+            with patch.object(bot, "_PROXY_POOL", proxies), patch.object(
+                bot, "_get_next_proxy", new_callable=AsyncMock,
+                side_effect=[(proxy, index) for index, proxy in enumerate(proxies)],
+            ), patch.object(bot.asyncio, "to_thread", new=fail_to_thread):
+                with self.assertRaises(bot._BridglyRequestError):
+                    await bot._fetch_site_list_with_fallback(
+                        "7090596962206893062", "following", 13, 2
+                    )
+
+        self.arun(scenario())
+        self.assertEqual(seen, [
+            bot.SOCIAL_SITE_ORIGINS[2], bot.SOCIAL_SITE_ORIGINS[0],
+            bot.SOCIAL_SITE_ORIGINS[1],
+        ])
+
+    def test_site_list_cache_is_scoped_by_uid_kind_and_access_count(self):
+        users = self.sample_users("cached")
+
+        async def scenario():
+            with patch.object(
+                bot, "_fetch_site_list_with_fallback", new_callable=AsyncMock,
+                return_value=users,
+            ) as fetch:
+                first = await bot._get_site_social_list(
+                    "sample", "followers", 3, "7090596962206893062"
+                )
+                second = await bot._get_site_social_list(
+                    "@sample", "followers", 3, "7090596962206893062"
+                )
+                full = await bot._get_site_social_list(
+                    "sample", "followers", 13, "7090596962206893062"
+                )
+            return first, second, full, fetch
+
+        first, second, full, fetch = self.arun(scenario())
+        self.assertEqual(first, users)
+        self.assertEqual(second, users)
+        self.assertEqual(full, users)
+        self.assertEqual(fetch.await_count, 2)
+        self.assertEqual(
+            [call.args for call in fetch.await_args_list],
+            [
+                ("7090596962206893062", "followers", 3, 0),
+                ("7090596962206893062", "followers", 13, 1),
+            ],
+        )
 
 
 if __name__ == "__main__":
