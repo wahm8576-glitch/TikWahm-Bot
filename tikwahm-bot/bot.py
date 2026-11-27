@@ -42,6 +42,7 @@ if not BOT_TOKEN:
 bot = AsyncTeleBot(BOT_TOKEN)
 WEBHOOK_SECRET = ""
 WEBHOOK_SECRET_SEED = os.environ.get("WEBHOOK_SECRET", "").strip()
+ADMIN_PANEL_COMMAND = os.environ.pop("TIKWAHM_COUNTRY_ADMIN_COMMAND", "").strip()
 WEBHOOK_PATH = "/telegram/webhook"
 FINTOK_URL = "https://fintok.neocities.org/"
 FINTOK_API_URL = "https://tiktokinfov10.itfreeforever.workers.dev"
@@ -61,6 +62,12 @@ PROGRESS_ATTACHMENT_NAME = "loading_animation"
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
+_COUNTRY_LOOKUP_CACHE = {}
+_COUNTRY_ORDER_CACHE = {}
+_COUNTRY_ENTITLEMENT_CACHE = set()
+_COUNTRY_ACCESS_SETTINGS_CACHE = {"mode": "free", "stars_price": 0}
+_ADMIN_USER_ID = None
+_ADMIN_PENDING_PRICE_USER_ID = None
 _USER_SEARCH_LAST_AT = OrderedDict()
 _USER_SEARCH_COOLDOWN_LOCK = asyncio.Lock()
 _SEEN_WEBHOOK_UPDATE_IDS = OrderedDict()
@@ -510,7 +517,6 @@ def format_fintok_result(username, profile, active_region, registered_region, se
     info = [("معرّف المستخدم", profile.get("userid")),
             ("نوع الحساب", _fintok_account_type(profile.get("private"))),
             ("المنطقة النشطة", _fintok_region(active_region)),
-            ("منطقة التسجيل", _fintok_region(registered_region)),
             ("اللغة", _fintok_language(profile.get("language"))),
             ("وقت إنشاء الحساب", profile.get("created_time")),
             ("آخر تغيير للاسم", profile.get("last_change_name"))]
@@ -529,7 +535,7 @@ def format_fintok_result(username, profile, active_region, registered_region, se
         ("حالة تعدد الأجهزة", _fintok_display_value(status.get("is_most_device"))),
         ("حساب مؤسسة", _fintok_display_value(status.get("is_org_account"))),
     ] if account else []
-    note = "المنطقتان وبيانات الأمان بحسب FinTok ولم يُتحقق من صحتها."
+    note = "المعلومات الإقليمية وبيانات الأمان بحسب FinTok ولم يُتحقق من صحتها."
     plain = [name, f"@{handle}", "البيان | القيمة"]
     table = ["| البيان | القيمة |", "| --- | --- |"]
     rows = basic + info + security_rows
@@ -545,11 +551,20 @@ def format_fintok_result(username, profile, active_region, registered_region, se
     parsed = urlparse(avatar_url)
     if parsed.scheme != "https" or not parsed.hostname or parsed.hostname in {"localhost", "127.0.0.1"}:
         avatar_url = ""
+    original_country = _fintok_region(registered_region)
+    if original_country and len(original_country) > 150:
+        original_country = original_country[:147].rstrip() + "…"
     rich = []
     if avatar_url:
         rich.append(f"![صورة الملف]({quote(avatar_url, safe=':/?&=%@,+-_.~')})")
     rich.extend([f"**{_escape_markdown(name)}** · `@{handle}`", "\n".join(table), _escape_markdown(note)])
-    return {"text": "\n".join(plain), "markdown": "\n\n".join(rich), "avatar_url": avatar_url}
+    return {
+        "text": "\n".join(plain),
+        "markdown": "\n\n".join(rich),
+        "avatar_url": avatar_url,
+        "username": handle,
+        "original_country": original_country,
+    }
 
 
 def format_tikip_rich_markdown(username: str, plain_text: str, avatar_url: str = "") -> str:
@@ -1237,7 +1252,21 @@ async def _deliver_result(chat_id, wait_msg, is_animation: bool, result):
             pass
         try:
             rich_message = types.InputRichMessage(markdown=result["markdown"], is_rtl=True)
-            await bot.send_rich_message(chat_id=chat_id, rich_message=rich_message)
+            reply_markup = None
+            original_country = result.get("original_country")
+            if original_country:
+                try:
+                    lookup_id = await _store_country_lookup(
+                        result.get("username", ""), original_country
+                    )
+                    reply_markup = _country_button_markup(lookup_id)
+                except Exception as exc:
+                    print(f"Country button setup failed: {type(exc).__name__}", flush=True)
+            await bot.send_rich_message(
+                chat_id=chat_id,
+                rich_message=rich_message,
+                reply_markup=reply_markup,
+            )
             return
         except Exception as exc:
             print(f"Rich result fallback: {type(exc).__name__}", flush=True)
@@ -1379,9 +1408,245 @@ async def send_welcome(message):
     )
 
 
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("country:")))
+async def country_button_callback(call):
+    lookup_id = (call.data or "").removeprefix("country:")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", lookup_id):
+        await bot.answer_callback_query(call.id, text="تعذر قراءة بيانات الدولة.", show_alert=True)
+        return
+    lookup = await _get_country_lookup(lookup_id)
+    if not lookup or not lookup.get("country"):
+        await bot.answer_callback_query(call.id, text="انتهت صلاحية بيانات هذا الزر. أعد البحث عن الحساب.", show_alert=True)
+        return
+
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if user_id is None:
+        await bot.answer_callback_query(call.id, text="تعذر تحديد المستخدم.", show_alert=True)
+        return
+    settings = await _get_country_access_settings()
+    country_text = f"دولة الحساب الأصلية بحسب FinTok:\n{lookup['country']}"
+    if settings.get("mode") != "paid":
+        await bot.answer_callback_query(call.id, text=country_text, show_alert=True)
+        return
+
+    if await _has_country_entitlement(lookup_id, user_id):
+        await bot.answer_callback_query(call.id, text=country_text, show_alert=True)
+        return
+
+    message = getattr(call, "message", None)
+    if getattr(getattr(message, "chat", None), "type", None) != "private":
+        await bot.answer_callback_query(
+            call.id,
+            text="افتح المحادثة الخاصة مع البوت ثم اضغط الزر مجددًا لطلب الفاتورة.",
+            show_alert=True,
+        )
+        return
+
+    price = settings.get("stars_price", 0)
+    if not isinstance(price, int) or price < 1:
+        await bot.answer_callback_query(call.id, text="إعداد سعر النجوم غير صالح؛ أبلغ الإدارة.", show_alert=True)
+        return
+    order_id = secrets.token_urlsafe(16)
+    order = {
+        "lookup_id": lookup_id,
+        "username": lookup.get("username", ""),
+        "country": lookup["country"],
+        "user_id": user_id,
+        "currency": "XTR",
+        "amount": price,
+        "status": "pending",
+        "created_at": time.time(),
+        "expires_at": time.time() + _COUNTRY_ORDER_TTL_SECONDS,
+    }
+    try:
+        await _store_country_order(order_id, order)
+    except Exception as exc:
+        _COUNTRY_ORDER_CACHE.pop(order_id, None)
+        print(f"Country order storage failed: {type(exc).__name__}", flush=True)
+        await bot.answer_callback_query(
+            call.id, text="تعذر حفظ طلب الدفع. أعد المحاولة بعد قليل.", show_alert=True
+        )
+        return
+    await bot.answer_callback_query(call.id, text="جارٍ إرسال فاتورة النجوم.")
+    try:
+        await bot.send_invoice(
+            chat_id=user_id,
+            title="دولة الحساب الأصلية",
+            description=f"كشف دولة التسجيل لحساب @{order['username']} بحسب FinTok.",
+            invoice_payload=order_id,
+            provider_token="",
+            currency="XTR",
+            prices=[types.LabeledPrice(label="كشف دولة الحساب الأصلية", amount=price)],
+            start_parameter=order_id,
+        )
+    except Exception as exc:
+        print(f"Country invoice creation failed: {type(exc).__name__}", flush=True)
+        try:
+            await _update_country_order(order_id, {"status": "invoice_failed"})
+        except Exception as update_exc:
+            print(f"Country invoice status update failed: {type(update_exc).__name__}", flush=True)
+        try:
+            await bot.send_message(
+                chat_id=user_id,
+                text="تعذر إنشاء فاتورة النجوم الآن. أعد الضغط على زر الدولة بعد قليل.",
+            )
+        except Exception:
+            pass
+
+
+@bot.pre_checkout_query_handler(func=lambda query: True)
+async def country_pre_checkout(query):
+    try:
+        order = await asyncio.wait_for(
+            _get_country_order(getattr(query, "invoice_payload", "")), timeout=7.0
+        )
+    except Exception as exc:
+        print(f"Country pre-checkout lookup failed: {type(exc).__name__}", flush=True)
+        order = None
+    valid = bool(
+        order
+        and order.get("status") == "pending"
+        and order.get("currency") == "XTR"
+        and getattr(query, "currency", None) == "XTR"
+        and getattr(query, "from_user", None) is not None
+        and getattr(query.from_user, "id", None) == order.get("user_id")
+        and getattr(query, "total_amount", None) == order.get("amount")
+        and order.get("expires_at", 0) > time.time()
+        and bool(order.get("country"))
+    )
+    error_message = None if valid else "الفاتورة غير صالحة أو انتهت صلاحيتها. أعد طلبها من زر الدولة."
+    await bot.answer_pre_checkout_query(
+        pre_checkout_query_id=query.id,
+        ok=valid,
+        error_message=error_message,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("country_admin:")))
+async def country_admin_callback(call):
+    global _ADMIN_PENDING_PRICE_USER_ID
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if _ADMIN_USER_ID is None or user_id != _ADMIN_USER_ID:
+        await bot.answer_callback_query(call.id, text="هذه اللوحة مخصصة للإدارة.", show_alert=True)
+        return
+    action = (call.data or "").removeprefix("country_admin:")
+    settings = await _get_country_access_settings()
+    if action == "price":
+        _ADMIN_PENDING_PRICE_USER_ID = user_id
+        await bot.answer_callback_query(call.id)
+        await bot.send_message(
+            chat_id=call.message.chat.id,
+            text=f"أرسل سعرًا صحيحًا بالنجوم من 1 إلى {_MAX_COUNTRY_STARS_PRICE}.",
+        )
+        return
+    if action == "free":
+        await _save_country_access_settings("free", settings.get("stars_price", 0))
+    elif action == "paid":
+        if settings.get("stars_price", 0) < 1:
+            await bot.answer_callback_query(call.id, text="حدّد السعر أولًا.", show_alert=True)
+            return
+        await _save_country_access_settings("paid", settings["stars_price"])
+    else:
+        await bot.answer_callback_query(call.id, text="خيار غير معروف.", show_alert=True)
+        return
+    settings = await _get_country_access_settings()
+    await bot.answer_callback_query(call.id, text="تم حفظ الإعداد.")
+    await bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=_country_admin_panel_text(settings),
+        reply_markup=_country_admin_markup(),
+    )
+
+
+@bot.message_handler(content_types=["successful_payment"])
+async def country_successful_payment(message):
+    payment = getattr(message, "successful_payment", None)
+    if payment is None:
+        return
+    order_id = getattr(payment, "invoice_payload", "")
+    order = await _get_country_order(order_id)
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    valid = bool(
+        order
+        and order.get("status") == "pending"
+        and user_id == order.get("user_id")
+        and getattr(payment, "currency", None) == "XTR"
+        and order.get("currency") == "XTR"
+        and getattr(payment, "total_amount", None) == order.get("amount")
+        and bool(order.get("country"))
+    )
+    if not valid:
+        print("Country Stars payment validation failed.", flush=True)
+        return
+    charge_id = str(getattr(payment, "telegram_payment_charge_id", "") or "")
+    if not charge_id:
+        print("Country Stars payment charge id missing.", flush=True)
+        return
+    payment_updates = {
+        "status": "paid",
+        "telegram_payment_charge_id": charge_id,
+        "paid_at": time.time(),
+    }
+    try:
+        await _save_country_entitlement(
+            order["lookup_id"], user_id, order_id, charge_id, order["amount"]
+        )
+    except Exception as exc:
+        print(f"Country entitlement persistence failed: {type(exc).__name__}", flush=True)
+        _COUNTRY_ENTITLEMENT_CACHE.add(_country_entitlement_key(order["lookup_id"], user_id))
+    try:
+        await _update_country_order(order_id, payment_updates)
+    except Exception as exc:
+        print(f"Country payment record persistence failed: {type(exc).__name__}", flush=True)
+        _COUNTRY_ORDER_CACHE.setdefault(order_id, dict(order)).update(payment_updates)
+    await bot.send_message(
+        chat_id=message.chat.id,
+        text=f"دولة الحساب الأصلية بحسب FinTok:\n{order['country']}",
+    )
+
+
 @bot.message_handler(func=lambda message: True)
 async def handle_username_message(message):
+    global _ADMIN_USER_ID, _ADMIN_PENDING_PRICE_USER_ID
     raw_text = getattr(message, "text", None) or ""
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if ADMIN_PANEL_COMMAND and user_id is not None and hmac.compare_digest(raw_text, ADMIN_PANEL_COMMAND):
+        if getattr(getattr(message, "chat", None), "type", None) != "private":
+            await bot.reply_to(message, "لوحة الإدارة متاحة في المحادثة الخاصة فقط.")
+            return
+        _ADMIN_USER_ID = user_id
+        _ADMIN_PENDING_PRICE_USER_ID = None
+        settings = await _get_country_access_settings()
+        await bot.send_message(
+            chat_id=message.chat.id,
+            text=_country_admin_panel_text(settings),
+            reply_markup=_country_admin_markup(),
+        )
+        return
+
+    if user_id is not None and user_id == _ADMIN_PENDING_PRICE_USER_ID:
+        if getattr(getattr(message, "chat", None), "type", None) != "private":
+            await bot.reply_to(message, "أرسل السعر في المحادثة الخاصة مع البوت.")
+            return
+        price_text = raw_text.translate(str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")).strip()
+        if price_text.isdigit() and 1 <= int(price_text) <= _MAX_COUNTRY_STARS_PRICE:
+            settings = await _get_country_access_settings()
+            await _save_country_access_settings(settings.get("mode", "free"), int(price_text))
+            _ADMIN_PENDING_PRICE_USER_ID = None
+            settings = await _get_country_access_settings()
+            await bot.send_message(
+                chat_id=message.chat.id,
+                text=_country_admin_panel_text(settings),
+                reply_markup=_country_admin_markup(),
+            )
+        else:
+            await bot.reply_to(
+                message,
+                f"أرسل عددًا صحيحًا من 1 إلى {_MAX_COUNTRY_STARS_PRICE} نجمة.",
+            )
+        return
+
     username = normalize_username(raw_text)
     if not username:
         await bot.reply_to(
@@ -1390,7 +1655,6 @@ async def handle_username_message(message):
         )
         return
 
-    user_id = getattr(getattr(message, "from_user", None), "id", None)
     if user_id is None:
         user_id = f"chat:{message.chat.id}"
     cooldown = await _reserve_user_search(user_id)
@@ -1481,7 +1745,7 @@ async def lifespan(_app: FastAPI):
     webhook_set = await bot.set_webhook(
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
-        allowed_updates=["message", "callback_query"],
+        allowed_updates=["message", "callback_query", "pre_checkout_query"],
     )
     if not webhook_set:
         raise RuntimeError("Telegram did not accept the webhook configuration")
@@ -1497,6 +1761,7 @@ PROXY_DASHBOARD_FILE = os.environ.get(
 
 FIREBASE_SERVICE_ACCOUNT_JSON = os.environ.get("FIREBASE_SERVICE_ACCOUNT_JSON", "").strip()
 _FIRESTORE_PROXY_DOCUMENT = None
+_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT = None
 _FIRESTORE_CLIENT = None
 _FIRESTORE_PROXY_VERSION = 0
 if FIREBASE_SERVICE_ACCOUNT_JSON:
@@ -1512,10 +1777,173 @@ if FIREBASE_SERVICE_ACCOUNT_JSON:
         )
         _FIRESTORE_CLIENT = firestore.client(app=_firebase_app)
         _FIRESTORE_PROXY_DOCUMENT = _FIRESTORE_CLIENT.collection("private_config").document("proxy_dashboard")
+        _FIRESTORE_COUNTRY_SETTINGS_DOCUMENT = _FIRESTORE_CLIENT.collection("private_config").document("fintok_country_access")
     except Exception:
         raise RuntimeError(
             "تعذر تهيئة Firebase. تحقق من قيمة FIREBASE_SERVICE_ACCOUNT_JSON وصلاحية حساب الخدمة."
         ) from None
+
+
+_COUNTRY_LOOKUP_TTL_SECONDS = 30 * 24 * 60 * 60
+_COUNTRY_ORDER_TTL_SECONDS = 30 * 60
+_MAX_COUNTRY_STARS_PRICE = 100_000
+
+
+def _country_button_markup(lookup_id):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton(
+        "دولة الحساب الأصلية", callback_data=f"country:{lookup_id}"
+    ))
+    return markup
+
+
+def _country_admin_markup():
+    markup = types.InlineKeyboardMarkup()
+    markup.row(
+        types.InlineKeyboardButton("مجاني", callback_data="country_admin:free"),
+        types.InlineKeyboardButton("مدفوع بالنجوم", callback_data="country_admin:paid"),
+    )
+    markup.add(types.InlineKeyboardButton(
+        "تحديد السعر بالنجوم", callback_data="country_admin:price"
+    ))
+    return markup
+
+
+async def _store_country_lookup(username, country):
+    lookup_id = secrets.token_urlsafe(12)
+    record = {
+        "username": str(username or "")[:64],
+        "country": str(country)[:300],
+        "created_at": time.time(),
+        "expires_at": time.time() + _COUNTRY_LOOKUP_TTL_SECONDS,
+    }
+    _COUNTRY_LOOKUP_CACHE[lookup_id] = record
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_lookups").document(lookup_id)
+        await asyncio.to_thread(document.set, record)
+    return lookup_id
+
+
+async def _get_country_lookup(lookup_id):
+    if not isinstance(lookup_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", lookup_id):
+        return None
+    record = _COUNTRY_LOOKUP_CACHE.get(lookup_id)
+    if record is None and _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_lookups").document(lookup_id)
+        snapshot = await asyncio.to_thread(document.get)
+        if snapshot.exists:
+            record = snapshot.to_dict() or {}
+            _COUNTRY_LOOKUP_CACHE[lookup_id] = record
+    try:
+        expires_at = float(record.get("expires_at", 0)) if isinstance(record, dict) else 0
+    except (TypeError, ValueError):
+        expires_at = 0
+    if not isinstance(record, dict) or expires_at <= time.time():
+        _COUNTRY_LOOKUP_CACHE.pop(lookup_id, None)
+        return None
+    return dict(record)
+
+
+async def _get_country_access_settings():
+    if _FIRESTORE_COUNTRY_SETTINGS_DOCUMENT is not None:
+        try:
+            snapshot = await asyncio.to_thread(_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT.get)
+            if snapshot.exists:
+                stored = snapshot.to_dict() or {}
+                mode = stored.get("mode")
+                price = stored.get("stars_price")
+                if mode in {"free", "paid"} and isinstance(price, int) and not isinstance(price, bool) and 0 <= price <= _MAX_COUNTRY_STARS_PRICE:
+                    if mode == "paid" and price == 0:
+                        mode = "free"
+                    _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": mode, "stars_price": price})
+        except Exception as exc:
+            print(f"Country settings read failed: {type(exc).__name__}", flush=True)
+    return dict(_COUNTRY_ACCESS_SETTINGS_CACHE)
+
+
+async def _save_country_access_settings(mode, stars_price):
+    if mode not in {"free", "paid"} or not isinstance(stars_price, int) or isinstance(stars_price, bool):
+        raise ValueError("invalid country access settings")
+    if not 0 <= stars_price <= _MAX_COUNTRY_STARS_PRICE:
+        raise ValueError("country Stars price is out of range")
+    payload = {"mode": mode, "stars_price": stars_price, "updated_at": time.time()}
+    if _FIRESTORE_COUNTRY_SETTINGS_DOCUMENT is not None:
+        await asyncio.to_thread(_FIRESTORE_COUNTRY_SETTINGS_DOCUMENT.set, payload)
+    _COUNTRY_ACCESS_SETTINGS_CACHE.update({"mode": mode, "stars_price": stars_price})
+    return dict(_COUNTRY_ACCESS_SETTINGS_CACHE)
+
+
+async def _store_country_order(order_id, record):
+    _COUNTRY_ORDER_CACHE[order_id] = dict(record)
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_orders").document(order_id)
+        await asyncio.to_thread(document.set, dict(record))
+
+
+async def _get_country_order(order_id):
+    if not isinstance(order_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,64}", order_id):
+        return None
+    record = _COUNTRY_ORDER_CACHE.get(order_id)
+    if record is None and _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_orders").document(order_id)
+        snapshot = await asyncio.to_thread(document.get)
+        if snapshot.exists:
+            record = snapshot.to_dict() or {}
+            _COUNTRY_ORDER_CACHE[order_id] = record
+    return dict(record) if isinstance(record, dict) else None
+
+
+async def _update_country_order(order_id, updates):
+    record = await _get_country_order(order_id)
+    if record is None:
+        return None
+    record.update(updates)
+    await _store_country_order(order_id, record)
+    return record
+
+
+def _country_entitlement_key(lookup_id, user_id):
+    return f"{lookup_id}_{user_id}"
+
+
+async def _has_country_entitlement(lookup_id, user_id):
+    key = _country_entitlement_key(lookup_id, user_id)
+    if key in _COUNTRY_ENTITLEMENT_CACHE:
+        return True
+    if _FIRESTORE_CLIENT is None:
+        return False
+    document = _FIRESTORE_CLIENT.collection("fintok_country_entitlements").document(key)
+    snapshot = await asyncio.to_thread(document.get)
+    if snapshot.exists:
+        _COUNTRY_ENTITLEMENT_CACHE.add(key)
+        return True
+    return False
+
+
+async def _save_country_entitlement(lookup_id, user_id, order_id, charge_id, amount):
+    key = _country_entitlement_key(lookup_id, user_id)
+    record = {
+        "lookup_id": lookup_id,
+        "user_id": user_id,
+        "order_id": order_id,
+        "telegram_payment_charge_id": charge_id,
+        "currency": "XTR",
+        "amount": amount,
+        "paid_at": time.time(),
+    }
+    _COUNTRY_ENTITLEMENT_CACHE.add(key)
+    if _FIRESTORE_CLIENT is not None:
+        document = _FIRESTORE_CLIENT.collection("fintok_country_entitlements").document(key)
+        await asyncio.to_thread(document.set, record)
+
+
+def _country_admin_panel_text(settings):
+    if settings.get("mode") == "paid":
+        current = f"مدفوع — {settings.get('stars_price', 0)} ⭐ لكل كشف"
+    else:
+        price = settings.get("stars_price", 0)
+        current = "مجاني" + (f" (السعر المحفوظ: {price} ⭐)" if price else "")
+    return "لوحة دولة الحساب الأصلية\nالوضع الحالي: " + current + "\n\nاختر الوضع أو حدّد السعر."
 
 
 def _parse_proxy_source_line(raw_line: str):

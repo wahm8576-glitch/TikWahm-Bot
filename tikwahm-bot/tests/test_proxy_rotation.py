@@ -210,12 +210,17 @@ class FinTokRequestTests(unittest.TestCase):
         self.assertIn("الإعجابات | 1.95K", result["text"])
         self.assertIn("نوع الحساب | عام (Public Account)", result["text"])
         self.assertIn("المنطقة النشطة | إيطاليا — Italy 🇮🇹 — المصدر: FinTok", result["text"])
-        self.assertIn("منطقة التسجيل | المملكة العربية السعودية — Saudi Arabia 🇸🇦 — المصدر: FinTok", result["text"])
+        self.assertEqual(
+            result["original_country"],
+            "المملكة العربية السعودية — Saudi Arabia 🇸🇦 — المصدر: FinTok",
+        )
+        self.assertNotIn("منطقة التسجيل", result["text"])
+        self.assertNotIn("Saudi Arabia", result["text"])
         self.assertIn("اللغة | العربية (Arabic)", result["text"])
         self.assertIn("البريد الإلكتروني مرتبط | نعم", result["text"])
         self.assertIn("حالة تسجيل الدخول | لا", result["text"])
         ordered_labels = ["يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
-                          "المنطقة النشطة", "منطقة التسجيل", "اللغة", "وقت إنشاء الحساب",
+                          "المنطقة النشطة", "اللغة", "وقت إنشاء الحساب",
                           "آخر تغيير للاسم", "البريد الإلكتروني مرتبط", "رقم الجوال مرتبط",
                           "كلمة المرور مُعيّنة", "مفتاح المرور (Passkey)", "OAuth مفعّل",
                           "المنصات المتصلة", "حالة تسجيل الدخول", "مستخدم FTC",

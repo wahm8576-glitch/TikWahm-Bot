@@ -42,12 +42,16 @@ class FinTokFormattingTests(unittest.TestCase):
         result = bot.format_fintok_result(
             "exact_user", self.profile, "United States", "Canada", self.security
         )
-        self.assertEqual(set(result), {"text", "markdown", "avatar_url"})
+        self.assertEqual(
+            set(result), {"text", "markdown", "avatar_url", "username", "original_country"}
+        )
         self.assertEqual(result["avatar_url"], self.profile["profile"])
+        self.assertEqual(result["username"], "exact_user")
+        self.assertEqual(result["original_country"], "كندا — Canada 🇨🇦 — المصدر: FinTok")
         combined = f'{result["text"]}\n{result["markdown"]}'
         expected_labels = [
             "يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
-            "المنطقة النشطة", "منطقة التسجيل", "اللغة", "وقت إنشاء الحساب",
+            "المنطقة النشطة", "اللغة", "وقت إنشاء الحساب",
             "آخر تغيير للاسم", "البريد الإلكتروني مرتبط", "رقم الجوال مرتبط",
             "كلمة المرور مُعيّنة", "مفتاح المرور (Passkey)", "OAuth مفعّل",
             "المنصات المتصلة", "حالة تسجيل الدخول", "مستخدم FTC",
@@ -58,23 +62,24 @@ class FinTokFormattingTests(unittest.TestCase):
         for value in (
             "1.23K", "56.79K", "987.65K", "9007199254740993", "عام (Public Account)",
             "الولايات المتحدة — United States 🇺🇸 — المصدر: FinTok",
-            "كندا — Canada 🇨🇦 — المصدر: FinTok",
             "الإنجليزية (en-US)", "03/07/2021, 04:05:06 PM", "11/29/2024, 09:08:07 AM",
             "Google, Facebook", "نعم", "لا",
         ):
             self.assertIn(value, combined)
         self.assertNotIn("Yes", combined)
         self.assertNotIn("No", combined)
+        self.assertNotIn("Canada", combined)
         self.assertIn("لم يُتحقق من صحتها", combined)
         self.assertIn("**Exact Display Name**", result["markdown"])
         table_lines = [line for line in result["markdown"].splitlines() if line.startswith("|")]
-        self.assertEqual(len(table_lines), 22)  # header, separator, and twenty field rows
+        self.assertEqual(len(table_lines), 21)  # header, separator, and nineteen field rows
         self.assertTrue(all(line.count("|") == 3 for line in table_lines))
 
     def test_private_accounts_and_missing_fields_are_not_fabricated(self):
         profile = {"fullname": "Only Name", "username": "sparse_user", "profile": "", "private": True}
         result = bot.format_fintok_result("sparse_user", profile, None, None, None)
         combined = f'{result["text"]}\n{result["markdown"]}'
+        self.assertIsNone(result["original_country"])
         self.assertEqual(result["avatar_url"], "")
         self.assertIn("Only Name", combined)
         self.assertIn("sparse_user", combined)
