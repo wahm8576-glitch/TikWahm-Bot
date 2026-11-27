@@ -25,8 +25,8 @@ class FinTokFormattingTests(unittest.TestCase):
             "last_change_name": "11/29/2024, 09:08:07 AM",
         }
         self.security = {
-            "is_email": True,
-            "is_mobile": False,
+            "is_email": "true",
+            "is_mobile": "false",
             "is_password": True,
             "is_passkey": False,
             "oauth": {"is_enabled": True, "platforms": ["Google", "Facebook"]},
@@ -38,7 +38,7 @@ class FinTokFormattingTests(unittest.TestCase):
             },
         }
 
-    def test_outputs_all_fields_in_exact_site_order_and_preserves_display_values(self):
+    def test_arabic_labels_preserve_every_value_and_site_order(self):
         result = bot.format_fintok_result(
             "exact_user", self.profile, "United States", "Canada", self.security
         )
@@ -46,21 +46,30 @@ class FinTokFormattingTests(unittest.TestCase):
         self.assertEqual(result["avatar_url"], self.profile["profile"])
         combined = f'{result["text"]}\n{result["markdown"]}'
         expected_labels = [
-            "Following", "Followers", "Likes", "User ID", "Account Type",
-            "Active Region", "Registered Region", "Language", "Created Time",
-            "Last Name Change", "Email Linked", "Mobile Linked", "Password Set",
-            "is PassKey", "OAuth Enabled", "Connected Platforms", "Logged In",
-            "FTC User", "Most Device", "Organization Account",
+            "يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
+            "المنطقة النشطة", "منطقة التسجيل", "اللغة", "وقت إنشاء الحساب",
+            "آخر تغيير للاسم", "البريد الإلكتروني مرتبط", "رقم الجوال مرتبط",
+            "كلمة المرور مُعيّنة", "مفتاح المرور (Passkey)", "OAuth مفعّل",
+            "المنصات المتصلة", "حالة تسجيل الدخول", "مستخدم FTC",
+            "حالة تعدد الأجهزة", "حساب مؤسسة",
         ]
         positions = [combined.index(label) for label in expected_labels]
         self.assertEqual(positions, sorted(positions))
         for value in (
-            "1.23K", "56.79K", "987.65K", "9007199254740993", "Public Account",
-            "United States 🇺🇸", "Canada 🇨🇦", "en-US", "03/07/2021, 04:05:06 PM",
-            "11/29/2024, 09:08:07 AM", "Google, Facebook", "Yes", "No",
+            "1.23K", "56.79K", "987.65K", "9007199254740993", "عام (Public Account)",
+            "الولايات المتحدة — United States 🇺🇸 — المصدر: FinTok",
+            "كندا — Canada 🇨🇦 — المصدر: FinTok",
+            "en-US", "03/07/2021, 04:05:06 PM", "11/29/2024, 09:08:07 AM",
+            "Google, Facebook", "نعم", "لا",
         ):
             self.assertIn(value, combined)
+        self.assertNotIn("Yes", combined)
+        self.assertNotIn("No", combined)
         self.assertIn("لم يُتحقق من صحتها", combined)
+        self.assertIn("**Exact Display Name**", result["markdown"])
+        table_lines = [line for line in result["markdown"].splitlines() if line.startswith("|")]
+        self.assertEqual(len(table_lines), 22)  # header, separator, and twenty field rows
+        self.assertTrue(all(line.count("|") == 3 for line in table_lines))
 
     def test_private_accounts_and_missing_fields_are_not_fabricated(self):
         profile = {"fullname": "Only Name", "username": "sparse_user", "profile": "", "private": True}
@@ -69,10 +78,10 @@ class FinTokFormattingTests(unittest.TestCase):
         self.assertEqual(result["avatar_url"], "")
         self.assertIn("Only Name", combined)
         self.assertIn("sparse_user", combined)
-        self.assertIn("Account Type", combined)
-        self.assertIn("Private Account", combined)
-        self.assertNotIn("Active Region", combined)
-        self.assertNotIn("Registered Region", combined)
+        self.assertIn("نوع الحساب", combined)
+        self.assertIn("خاص (Private Account)", combined)
+        self.assertNotIn("المنطقة النشطة", combined)
+        self.assertNotIn("منطقة التسجيل", combined)
         self.assertNotIn("Unavailable", combined)
         self.assertNotIn("N/A", combined)
         self.assertNotIn("None", combined)

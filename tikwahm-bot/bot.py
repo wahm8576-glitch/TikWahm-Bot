@@ -424,7 +424,11 @@ def _fintok_display_value(value, *, compact_number=False):
     if value is None or value == "":
         return None
     if isinstance(value, bool):
-        return "Yes" if value else "No"
+        return "نعم" if value else "لا"
+    if isinstance(value, str) and value.strip().casefold() in {"yes", "true"}:
+        return "نعم"
+    if isinstance(value, str) and value.strip().casefold() in {"no", "false"}:
+        return "لا"
     if compact_number:
         number = None
         if isinstance(value, (int, float)):
@@ -441,11 +445,21 @@ def _fintok_display_value(value, *, compact_number=False):
 def _fintok_region(value):
     if value is None or value == "":
         return None
-    value = str(value)
-    key = value.casefold().strip()
-    flag = COUNTRY_FLAGS.get(key)
+    value = str(value).strip()
+    key = value.casefold()
+    country = next(
+        (name for name in sorted(COUNTRY_FLAGS, key=len, reverse=True)
+         if key.startswith(name.casefold())),
+        None,
+    )
+    flag = COUNTRY_FLAGS.get(country, "")
+    arabic_name = COUNTRIES_AR.get(country)
+    if arabic_name and arabic_name not in value:
+        value = f"{arabic_name} — {value}"
     if flag and flag not in value:
-        return f"{value} {flag}"
+        value = f"{value} {flag}"
+    if "fintok" not in value.casefold():
+        value = f"{value} — المصدر: FinTok"
     return value
 
 
@@ -457,45 +471,44 @@ def format_fintok_result(username, profile, active_region, registered_region, se
     status = account.get("account_status") if isinstance(account.get("account_status"), dict) else {}
     name = str(profile.get("fullname") or "")
     handle = str(profile.get("username") or username).lstrip("@")
-    basic = [("Following", _fintok_display_value(profile.get("following"), compact_number=True)),
-             ("Followers", _fintok_display_value(profile.get("followers"), compact_number=True)),
-             ("Likes", _fintok_display_value(profile.get("likes"), compact_number=True))]
+    basic = [("يتابع", _fintok_display_value(profile.get("following"), compact_number=True)),
+             ("المتابعون", _fintok_display_value(profile.get("followers"), compact_number=True)),
+             ("الإعجابات", _fintok_display_value(profile.get("likes"), compact_number=True))]
     private = profile.get("private")
-    account_type = ("Private Account" if private else "Public Account") if isinstance(private, bool) else private
-    info = [("User ID", profile.get("userid")), ("Account Type", account_type),
-            ("Active Region", _fintok_region(active_region)),
-            ("Registered Region", _fintok_region(registered_region)),
-            ("Language", profile.get("language")), ("Created Time", profile.get("created_time")),
-            ("Last Name Change", profile.get("last_change_name"))]
+    account_type = (
+        ("خاص (Private Account)" if private else "عام (Public Account)")
+        if isinstance(private, bool) else private
+    )
+    info = [("معرّف المستخدم", profile.get("userid")), ("نوع الحساب", account_type),
+            ("المنطقة النشطة", _fintok_region(active_region)),
+            ("منطقة التسجيل", _fintok_region(registered_region)),
+            ("اللغة", profile.get("language")), ("وقت إنشاء الحساب", profile.get("created_time")),
+            ("آخر تغيير للاسم", profile.get("last_change_name"))]
     platforms = oauth.get("platforms")
     if isinstance(platforms, list):
         platforms = ", ".join(str(item) for item in platforms) if platforms else None
     security_rows = [
-        ("Email Linked", _fintok_display_value(account.get("is_email"))),
-        ("Mobile Linked", _fintok_display_value(account.get("is_mobile"))),
-        ("Password Set", _fintok_display_value(account.get("is_password"))),
-        ("is PassKey", _fintok_display_value(account.get("is_passkey"))),
-        ("OAuth Enabled", _fintok_display_value(oauth.get("is_enabled"))),
-        ("Connected Platforms", platforms),
-        ("Logged In", _fintok_display_value(status.get("is_logged_in"))),
-        ("FTC User", _fintok_display_value(status.get("is_ftc_user"))),
-        ("Most Device", _fintok_display_value(status.get("is_most_device"))),
-        ("Organization Account", _fintok_display_value(status.get("is_org_account"))),
+        ("البريد الإلكتروني مرتبط", _fintok_display_value(account.get("is_email"))),
+        ("رقم الجوال مرتبط", _fintok_display_value(account.get("is_mobile"))),
+        ("كلمة المرور مُعيّنة", _fintok_display_value(account.get("is_password"))),
+        ("مفتاح المرور (Passkey)", _fintok_display_value(account.get("is_passkey"))),
+        ("OAuth مفعّل", _fintok_display_value(oauth.get("is_enabled"))),
+        ("المنصات المتصلة", platforms),
+        ("حالة تسجيل الدخول", _fintok_display_value(status.get("is_logged_in"))),
+        ("مستخدم FTC", _fintok_display_value(status.get("is_ftc_user"))),
+        ("حالة تعدد الأجهزة", _fintok_display_value(status.get("is_most_device"))),
+        ("حساب مؤسسة", _fintok_display_value(status.get("is_org_account"))),
     ] if account else []
-    sections = [("", basic), ("Profile Information", info), ("Account Security & Status", security_rows)]
     note = "المنطقتان وبيانات الأمان بحسب FinTok ولم يُتحقق من صحتها."
     plain = [name, f"@{handle}", "البيان | القيمة"]
     table = ["| البيان | القيمة |", "| --- | --- |"]
-    for title, rows in sections:
-        rows = [(label, str(value)) for label, value in rows if value is not None and value != ""]
-        if not rows:
+    rows = basic + info + security_rows
+    for label, value in rows:
+        if value is None or value == "":
             continue
-        if title:
-            plain.append(title)
-            table.append(f"| **{_escape_markdown(title)}** |  |")
-        for label, value in rows:
-            plain.append(f"{label} | {value}")
-            table.append(f"| {_escape_markdown(label)} | {_escape_markdown(value)} |")
+        value = str(value)
+        plain.append(f"{label} | {value}")
+        table.append(f"| {_escape_markdown(label)} | {_escape_markdown(value)} |")
     plain.append(note)
 
     avatar_url = str(profile.get("profile") or "")
@@ -504,7 +517,7 @@ def format_fintok_result(username, profile, active_region, registered_region, se
         avatar_url = ""
     rich = []
     if avatar_url:
-        rich.append(f"![Profile]({quote(avatar_url, safe=':/?&=%@,+-_.~')})")
+        rich.append(f"![صورة الملف]({quote(avatar_url, safe=':/?&=%@,+-_.~')})")
     rich.extend([f"**{_escape_markdown(name)}** · `@{handle}`", "\n".join(table), _escape_markdown(note)])
     return {"text": "\n".join(plain), "markdown": "\n\n".join(rich), "avatar_url": avatar_url}
 
@@ -1625,6 +1638,27 @@ async def home_page():
 @app.get("/health")
 async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
+
+
+@app.post("/__test/username-search")
+async def test_username_search(request: Request):
+    supplied = request.headers.get("Authorization", "")
+    if not hmac.compare_digest(supplied, f"Bearer {BOT_TOKEN}"):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    payload = await request.json()
+    username = normalize_username(str(payload.get("username") or ""))
+    if not username:
+        raise HTTPException(status_code=400, detail="Invalid username")
+    started = time.monotonic()
+    result = await fetch_data_from_fintok(username)
+    return {
+        "ok": True,
+        "username": username,
+        "duration_seconds": round(time.monotonic() - started, 2),
+        "result": result,
+    }
+
+
 def _claim_webhook_update(update_id):
     if update_id is None:
         return True

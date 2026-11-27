@@ -206,18 +206,19 @@ class FinTokRequestTests(unittest.TestCase):
 
         self.assertEqual({row[0] for row in seen}, {"/", "/security", "/active", "/registered"})
         self.assertTrue(all(row[3] == self.proxy["host"] for row in seen))
-        self.assertIn("Followers | 8.83K", result["text"])
-        self.assertIn("Likes | 1.95K", result["text"])
-        self.assertIn("Account Type | Public Account", result["text"])
-        self.assertIn("Active Region | Italy 🇮🇹", result["text"])
-        self.assertIn("Registered Region | Saudi Arabia 🇸🇦", result["text"])
-        self.assertIn("Email Linked | Yes", result["text"])
-        self.assertIn("Logged In | No", result["text"])
-        ordered_labels = ["Following", "Followers", "Likes", "User ID", "Account Type",
-                          "Active Region", "Registered Region", "Language", "Created Time",
-                          "Last Name Change", "Email Linked", "Mobile Linked", "Password Set",
-                          "is PassKey", "OAuth Enabled", "Connected Platforms", "Logged In",
-                          "FTC User", "Most Device", "Organization Account"]
+        self.assertIn("المتابعون | 8.83K", result["text"])
+        self.assertIn("الإعجابات | 1.95K", result["text"])
+        self.assertIn("نوع الحساب | عام (Public Account)", result["text"])
+        self.assertIn("المنطقة النشطة | إيطاليا — Italy 🇮🇹 — المصدر: FinTok", result["text"])
+        self.assertIn("منطقة التسجيل | المملكة العربية السعودية — Saudi Arabia 🇸🇦 — المصدر: FinTok", result["text"])
+        self.assertIn("البريد الإلكتروني مرتبط | نعم", result["text"])
+        self.assertIn("حالة تسجيل الدخول | لا", result["text"])
+        ordered_labels = ["يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
+                          "المنطقة النشطة", "منطقة التسجيل", "اللغة", "وقت إنشاء الحساب",
+                          "آخر تغيير للاسم", "البريد الإلكتروني مرتبط", "رقم الجوال مرتبط",
+                          "كلمة المرور مُعيّنة", "مفتاح المرور (Passkey)", "OAuth مفعّل",
+                          "المنصات المتصلة", "حالة تسجيل الدخول", "مستخدم FTC",
+                          "حالة تعدد الأجهزة", "حساب مؤسسة"]
         positions = [result["text"].index(label) for label in ordered_labels]
         self.assertEqual(positions, sorted(positions))
 
