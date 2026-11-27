@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -38,17 +39,23 @@ class BridglyListTests(unittest.TestCase):
             "cache": bot._BRIDGLY_LIST_CACHE,
             "tasks": bot._BRIDGLY_LIST_TASKS,
             "lock": bot._BRIDGLY_LIST_LOCK,
+            "avatar_cache": bot._AVATAR_THUMBNAIL_CACHE,
+            "avatar_semaphore": bot._AVATAR_THUMBNAIL_SEMAPHORE,
         }
         bot.BRIDGLY_API_KEY = "unit-test-key-not-for-network"
         bot._BRIDGLY_LIST_CACHE = bot.OrderedDict()
         bot._BRIDGLY_LIST_TASKS = {}
         bot._BRIDGLY_LIST_LOCK = asyncio.Lock()
+        bot._AVATAR_THUMBNAIL_CACHE = bot.OrderedDict()
+        bot._AVATAR_THUMBNAIL_SEMAPHORE = asyncio.Semaphore(3)
 
     def tearDown(self):
         bot.BRIDGLY_API_KEY = self.saved["api_key"]
         bot._BRIDGLY_LIST_CACHE = self.saved["cache"]
         bot._BRIDGLY_LIST_TASKS = self.saved["tasks"]
         bot._BRIDGLY_LIST_LOCK = self.saved["lock"]
+        bot._AVATAR_THUMBNAIL_CACHE = self.saved["avatar_cache"]
+        bot._AVATAR_THUMBNAIL_SEMAPHORE = self.saved["avatar_semaphore"]
 
     @staticmethod
     def arun(awaitable):
@@ -132,9 +139,11 @@ class BridglyListTests(unittest.TestCase):
                 self.assertEqual(rich.blocks[1].text, "الحساب @menharef")
                 photo_blocks = [block for block in rich.blocks if isinstance(block, bot.types.InputRichBlockPhoto)]
                 self.assertEqual(len(photo_blocks), 5)
+                divider_blocks = [block for block in rich.blocks if isinstance(block, bot.types.InputRichBlockDivider)]
+                self.assertEqual(len(divider_blocks), 4)
                 self.assertEqual(photo_blocks[0].photo.media, users[0]["avatar_url"])
-                self.assertIn("Display 0", photo_blocks[0].caption.text)
-                self.assertIn("@person_0", photo_blocks[0].caption.text)
+                self.assertEqual(photo_blocks[0].caption.text[0].text, "Display 0")
+                self.assertEqual(photo_blocks[0].caption.text[2], "@person_0")
 
     def test_plain_fallback_has_neutral_heading_and_no_recency_or_source_disclaimer(self):
         text = bot._format_bridgly_list_text(
@@ -148,6 +157,109 @@ class BridglyListTests(unittest.TestCase):
         self.assertNotIn("غير موثّق", text)
         self.assertNotIn("الأحدث", text)
         self.assertNotIn("آخر خمسة", text)
+        self.assertIn("👤 𝓐", text)
+        self.assertIn("────────────", bot._format_bridgly_list_text(
+            "menharef",
+            [{"handle": "one", "nickname": "First"}, {"handle": "two", "nickname": "Second"}],
+            "followers",
+        ))
+
+    def test_avatar_thumbnail_is_small_jpeg_and_rejects_untrusted_hosts(self):
+        from io import BytesIO
+        from PIL import Image
+
+        image_buffer = BytesIO()
+        Image.new("RGB", (500, 320), "red").save(image_buffer, format="PNG")
+        image_payload = image_buffer.getvalue()
+
+        class FakeAvatarResponse:
+            headers = SimpleNamespace(get_content_type=lambda: "image/png")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def geturl(self):
+                return "https://p16-sign-va.tiktokcdn.com/avatar.png"
+
+            def read(self, _limit):
+                return image_payload
+
+        class FakeOpener:
+            def open(self, _request, timeout):
+                self.timeout = timeout
+                return FakeAvatarResponse()
+
+        opener = FakeOpener()
+        with patch.object(bot.urllib.request, "build_opener", return_value=opener):
+            thumbnail = bot._create_avatar_thumbnail(
+                "https://p16-sign-va.tiktokcdn.com/avatar.png"
+            )
+        resized = Image.open(BytesIO(thumbnail))
+        self.assertEqual(resized.size, (bot.AVATAR_THUMBNAIL_SIZE,) * 2)
+        self.assertEqual(resized.format, "JPEG")
+        self.assertLess(len(thumbnail), len(image_payload))
+        with patch.object(bot.urllib.request, "build_opener") as build_opener:
+            self.assertIsNone(bot._create_avatar_thumbnail("https://example.com/avatar.png"))
+        build_opener.assert_not_called()
+
+    def test_avatar_thumbnail_rejects_excessive_pixel_count_before_decoding(self):
+        image = SimpleNamespace(width=2001, height=2000, seek=lambda _index: None)
+        image.convert = unittest.mock.Mock(side_effect=AssertionError("should not decode"))
+        image_context = unittest.mock.MagicMock()
+        image_context.__enter__.return_value = image
+        response = unittest.mock.MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = "https://p16.tiktokcdn.com/a.png"
+        response.headers.get_content_type.return_value = "image/png"
+        response.read.return_value = b"fake image"
+        opener = SimpleNamespace(open=lambda *_args, **_kwargs: response)
+        with patch.object(bot.urllib.request, "build_opener", return_value=opener), \
+             patch.object(bot.Image, "open", return_value=image_context):
+            self.assertIsNone(bot._create_avatar_thumbnail("https://p16.tiktokcdn.com/a.png"))
+        image.convert.assert_not_called()
+
+    def test_avatar_thumbnail_downloads_are_globally_bounded(self):
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_thumbnail(_url):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return b"tiny-jpeg"
+
+        async def scenario():
+            with patch.object(bot, "_create_avatar_thumbnail", side_effect=fake_thumbnail):
+                return await asyncio.gather(*[
+                    bot._create_avatar_thumbnail_bounded(str(i)) for i in range(10)
+                ])
+
+        self.assertEqual(self.arun(scenario()), [b"tiny-jpeg"] * 10)
+        self.assertLessEqual(peak, 3)
+
+    def test_avatar_thumbnail_route_serves_only_short_lived_cached_images(self):
+        async def scenario():
+            with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": "https://tikwahm-bot-new.onrender.com"}), \
+                 patch.object(bot, "_create_avatar_thumbnail", return_value=b"tiny-jpeg"):
+                prepared = await bot._prepare_bridgly_list_avatars([
+                    {"handle": "one", "nickname": "One", "avatar_url": "https://p16-sign-va.tiktokcdn.com/avatar.png"}
+                ])
+            return prepared
+
+        prepared = self.arun(scenario())
+        self.assertRegex(prepared[0]["avatar_url"], r"^https://tikwahm-bot-new\.onrender\.com/avatar-thumb/[A-Za-z0-9_-]+\.jpg$")
+        token = prepared[0]["avatar_url"].rsplit("/", 1)[-1].removesuffix(".jpg")
+        response = self.arun(bot.avatar_thumbnail(token))
+        self.assertEqual(response.media_type, "image/jpeg")
+        self.assertEqual(response.body, b"tiny-jpeg")
 
     def test_empty_list_does_not_claim_account_follows_nobody(self):
         text = bot._format_bridgly_list_text("menharef", [], "following")
@@ -212,7 +324,7 @@ class BridglyListTests(unittest.TestCase):
             with self.subTest(list_kind=list_kind):
                 users = self.sample_users(list_kind)
                 call = self.callback(list_kind=list_kind, callback_id=f"{list_kind}-callback")
-                with patch.object(
+                with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": ""}), patch.object(
                     bot, "_get_country_lookup", new_callable=AsyncMock,
                     return_value={"username": "menharef"},
                 ), patch.object(

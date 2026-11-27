@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import html
+from io import BytesIO
 import json
 import math
 import os
@@ -21,7 +22,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from PIL import Image, ImageOps
 import uvicorn
 
 try:
@@ -54,6 +56,13 @@ BRIDGLY_LIST_CACHE_MAX_AGE_HOURS = 24
 BRIDGLY_LIST_CACHE_TTL_SECONDS = 10 * 60
 BRIDGLY_REQUEST_TIMEOUT_SECONDS = 8
 MAX_FOLLOWER_NAMES = 5
+AVATAR_THUMBNAIL_SIZE = 88
+AVATAR_THUMBNAIL_MAX_BYTES = 2 * 1024 * 1024
+AVATAR_THUMBNAIL_MAX_PIXELS = 4_000_000
+AVATAR_THUMBNAIL_TTL_SECONDS = 30 * 60
+AVATAR_THUMBNAIL_CACHE_LIMIT = 500
+_AVATAR_THUMBNAIL_CACHE = OrderedDict()
+_AVATAR_THUMBNAIL_SEMAPHORE = asyncio.Semaphore(3)
 # Public client-side request salt from FinTok's own JavaScript; not a credential.
 FINTOK_SIGNATURE_SALT = "x2x7x1x90x79x24x001x"
 MAX_LOOKUP_SECONDS = 15
@@ -1720,6 +1729,7 @@ async def _bridgly_list_button_callback(call, list_kind):
         )
         return
 
+    users = await _prepare_bridgly_list_avatars(users)
     rich_message = _format_bridgly_list_rich_message(
         lookup["username"], users, list_kind
     )
@@ -2272,7 +2282,10 @@ def _request_bridgly_social_list(username, list_kind):
         nickname = str(
             user.get("nickname") or user.get("displayName") or user.get("display_name") or ""
         ).strip()
-        avatar_url = str(user.get("avatarUrl") or user.get("avatar_url") or "").strip()
+        avatar_url = str(
+            user.get("avatarThumb") or user.get("avatar_thumb")
+            or user.get("avatarUrl") or user.get("avatar_url") or ""
+        ).strip()
         parsed_avatar = urlparse(avatar_url)
         if (
             parsed_avatar.scheme != "https" or not parsed_avatar.hostname
@@ -2356,6 +2369,108 @@ async def _get_bridgly_following(username):
     return await _get_bridgly_social_list(username, "following")
 
 
+def _is_allowed_tiktok_avatar_url(avatar_url):
+    parsed = urlparse(str(avatar_url or ""))
+    host = (parsed.hostname or "").casefold().rstrip(".")
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    allowed_hosts = ("tiktokcdn.com", "tiktokcdn-us.com")
+    return (
+        parsed.scheme == "https"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and any(host == suffix or host.endswith("." + suffix) for suffix in allowed_hosts)
+    )
+
+
+class _TikTokAvatarRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _is_allowed_tiktok_avatar_url(newurl):
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _create_avatar_thumbnail(avatar_url):
+    if not _is_allowed_tiktok_avatar_url(avatar_url):
+        return None
+    request = urllib.request.Request(
+        avatar_url, headers={"User-Agent": "TikWahm/1.0"}
+    )
+    opener = urllib.request.build_opener(_TikTokAvatarRedirectHandler)
+    try:
+        with opener.open(request, timeout=4) as response:
+            if not _is_allowed_tiktok_avatar_url(response.geturl()):
+                return None
+            if not response.headers.get_content_type().startswith("image/"):
+                return None
+            raw_image = response.read(AVATAR_THUMBNAIL_MAX_BYTES + 1)
+        if not raw_image or len(raw_image) > AVATAR_THUMBNAIL_MAX_BYTES:
+            return None
+        with Image.open(BytesIO(raw_image)) as image:
+            image.seek(0)
+            if (image.width < 1 or image.height < 1
+                    or image.width * image.height > AVATAR_THUMBNAIL_MAX_PIXELS):
+                return None
+            thumbnail = ImageOps.fit(
+                image.convert("RGB"),
+                (AVATAR_THUMBNAIL_SIZE, AVATAR_THUMBNAIL_SIZE),
+                method=Image.Resampling.LANCZOS,
+            )
+            output = BytesIO()
+            thumbnail.save(output, format="JPEG", quality=72, optimize=True)
+            return output.getvalue()
+    except Exception:
+        return None
+
+
+async def _create_avatar_thumbnail_bounded(avatar_url):
+    try:
+        await asyncio.wait_for(_AVATAR_THUMBNAIL_SEMAPHORE.acquire(), timeout=8)
+    except asyncio.TimeoutError:
+        return None
+    semaphore = _AVATAR_THUMBNAIL_SEMAPHORE
+    task = asyncio.create_task(asyncio.to_thread(_create_avatar_thumbnail, avatar_url))
+    task.add_done_callback(lambda _task: semaphore.release())
+    return await asyncio.shield(task)
+
+
+async def _prepare_bridgly_list_avatars(users):
+    public_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    parsed_public_url = urlparse(public_url)
+    if parsed_public_url.scheme != "https" or not parsed_public_url.hostname:
+        return [dict(user) for user in (users or [])]
+
+    prepared = [dict(user) for user in (users or [])[:MAX_FOLLOWER_NAMES]]
+    thumbnails = await asyncio.gather(*[
+        _create_avatar_thumbnail_bounded(user.get("avatar_url"))
+        for user in prepared
+    ])
+    now = time.monotonic()
+    for user, thumbnail in zip(prepared, thumbnails):
+        if not thumbnail:
+            user["avatar_url"] = ""
+            continue
+        token = secrets.token_urlsafe(18)
+        _AVATAR_THUMBNAIL_CACHE[token] = (
+            now + AVATAR_THUMBNAIL_TTL_SECONDS,
+            thumbnail,
+        )
+        _AVATAR_THUMBNAIL_CACHE.move_to_end(token)
+        user["avatar_url"] = f"{public_url}/avatar-thumb/{token}.jpg"
+    expired = [
+        token for token, (expires_at, _) in _AVATAR_THUMBNAIL_CACHE.items()
+        if expires_at <= now
+    ]
+    for token in expired:
+        _AVATAR_THUMBNAIL_CACHE.pop(token, None)
+    while len(_AVATAR_THUMBNAIL_CACHE) > AVATAR_THUMBNAIL_CACHE_LIMIT:
+        _AVATAR_THUMBNAIL_CACHE.popitem(last=False)
+    return prepared
+
+
 def _format_bridgly_list_text(username, users, list_kind):
     username = str(username or "").lstrip("@")
     title = (
@@ -2364,16 +2479,19 @@ def _format_bridgly_list_text(username, users, list_kind):
         else "قائمة الحسابات التي يتابعها"
     )
     lines = [title, f"الحساب @{username}"]
+    entries = []
     for user in (users or [])[:MAX_FOLLOWER_NAMES]:
         handle = str(user.get("handle") or "").strip().lstrip("@")
         nickname = str(user.get("nickname") or "").strip()
-        if handle and nickname:
-            lines.append(f"• {nickname} — @{handle}")
-        elif handle:
-            lines.append(f"• @{handle}")
-        elif nickname:
-            lines.append(f"• {nickname}")
-    if len(lines) == 2:
+        if handle or nickname:
+            entries.append((nickname or "اسم غير متاح", handle))
+    for index, (nickname, handle) in enumerate(entries):
+        lines.append(f"\n👤 {nickname}")
+        if handle:
+            lines.append(f"@{handle}")
+        if index < len(entries) - 1:
+            lines.append("────────────")
+    if not entries:
         lines.append("لم يُعد المصدر أسماءً لهذه القائمة.")
     return "\n".join(lines)
 
@@ -2393,26 +2511,35 @@ def _format_bridgly_list_rich_message(username, users, list_kind):
         types.InputRichBlockSectionHeading(text=title, size=3),
         types.InputRichBlockParagraph(text=f"الحساب @{username}"),
     ]
-    has_users = False
+    entries = []
     for user in (users or [])[:MAX_FOLLOWER_NAMES]:
         handle = str(user.get("handle") or "").strip().lstrip("@")
         nickname = str(user.get("nickname") or "").strip() or "اسم غير متاح"
-        caption_parts = [f"الاسم: {nickname}"]
-        if handle:
-            caption_parts.append(f"المستخدم: @{handle}")
-        caption = "\n".join(caption_parts)
         avatar_url = str(user.get("avatar_url") or "").strip()
         parsed_avatar = urlparse(avatar_url)
-        has_users = has_users or bool(handle or nickname)
-        if parsed_avatar.scheme == "https" and parsed_avatar.hostname:
+        entries.append((
+            nickname,
+            handle,
+            avatar_url if parsed_avatar.scheme == "https" and parsed_avatar.hostname else "",
+        ))
+
+    for index, (nickname, handle, avatar_url) in enumerate(entries):
+        caption = [types.RichTextBold(text=nickname)]
+        if handle:
+            caption.extend(["\n", f"@{handle}"])
+        if avatar_url:
             photo = types.InputMediaPhoto(media=avatar_url)
             blocks.append(types.InputRichBlockPhoto(
                 photo=photo,
                 caption=types.RichBlockCaption(text=caption),
             ))
         else:
-            blocks.append(types.InputRichBlockParagraph(text=caption))
-    if not has_users:
+            blocks.append(types.InputRichBlockSectionHeading(text=nickname, size=4))
+            if handle:
+                blocks.append(types.InputRichBlockParagraph(text=f"@{handle}"))
+        if index < len(entries) - 1:
+            blocks.append(types.InputRichBlockDivider())
+    if not entries:
         blocks.append(types.InputRichBlockParagraph(text="لم يُعد المصدر أسماءً لهذه القائمة."))
     return types.InputRichMessage(blocks=blocks, is_rtl=True)
 
@@ -3093,6 +3220,27 @@ async def home_page():
 @app.get("/health")
 async def health_check():
     return {"ok": True, "service": "tikwahm", "mode": "webhook"}
+
+
+@app.get("/avatar-thumb/{token}.jpg")
+async def avatar_thumbnail(token: str):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", token):
+        return PlainTextResponse("Not found", status_code=404)
+    record = _AVATAR_THUMBNAIL_CACHE.get(token)
+    if not isinstance(record, tuple) or len(record) != 2:
+        return PlainTextResponse("Not found", status_code=404)
+    expires_at, image_bytes = record
+    if expires_at <= time.monotonic():
+        _AVATAR_THUMBNAIL_CACHE.pop(token, None)
+        return PlainTextResponse("Not found", status_code=404)
+    return Response(
+        content=image_bytes,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "public, max-age=900",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 def _claim_webhook_update(update_id):

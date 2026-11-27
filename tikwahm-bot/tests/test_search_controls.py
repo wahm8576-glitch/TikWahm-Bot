@@ -223,6 +223,11 @@ class SearchControlsTests(unittest.TestCase):
         self.assertTrue(followers_button.callback_data.startswith("followers:"))
         self.assertEqual(following_button.text, "قائمة اللي يتابعهم")
         self.assertTrue(following_button.callback_data.startswith("following:"))
+        self.assertEqual(len(markup.keyboard), 2)
+        self.assertFalse(any(
+            button.callback_data and button.callback_data.startswith("story:")
+            for row in markup.keyboard for button in row
+        ))
         lookup_id = country_button.callback_data.removeprefix("country:")
         self.assertEqual(followers_button.callback_data, f"followers:{lookup_id}")
         self.assertEqual(following_button.callback_data, f"following:{lookup_id}")
@@ -249,6 +254,10 @@ class SearchControlsTests(unittest.TestCase):
         self.assertTrue(markup.keyboard[0][0].callback_data.startswith("followers:"))
         self.assertEqual(markup.keyboard[0][1].text, "قائمة اللي يتابعهم")
         self.assertTrue(markup.keyboard[0][1].callback_data.startswith("following:"))
+        self.assertFalse(any(
+            button.callback_data and button.callback_data.startswith("story:")
+            for row in markup.keyboard for button in row
+        ))
 
     def test_country_name_resolves_to_a_real_png_flag_url(self):
         self.assertEqual(
