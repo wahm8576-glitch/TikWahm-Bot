@@ -1034,9 +1034,102 @@ async def _reserve_user_search(user_id, now=None):
 
 
 def _search_cooldown_text(remaining: int) -> str:
-    return (
-        f"مهلًا، يُسمح ببحث واحد كل {_arabic_digits(USER_SEARCH_COOLDOWN_SECONDS)} ثانية. "
-        f"حاول بعد {_arabic_digits(remaining)} ثانية."
+    number = _arabic_digits(remaining)
+    if remaining == 1:
+        phrase = "ثانية"
+    elif remaining == 2:
+        phrase = "ثانيتين"
+    elif 3 <= remaining <= 10:
+        phrase = f"{number} ثوانٍ"
+    else:
+        phrase = f"{number} ثانية"
+    return f"🔎 البحث متاح بعد {phrase}"
+
+
+async def _run_search_cooldown_countdown(
+    chat_id, wait_msg, is_animation, deadline, *, initial_seconds=None,
+    clock=None, sleep=None,
+):
+    clock = clock or time.monotonic
+    sleep = sleep or asyncio.sleep
+    last_displayed = initial_seconds
+    while True:
+        remaining = deadline - clock()
+        seconds = math.ceil(max(0.0, remaining))
+        if seconds <= 0:
+            break
+        if seconds != last_displayed:
+            try:
+                await _edit_wait_message(
+                    chat_id, wait_msg, is_animation, _search_cooldown_text(seconds)
+                )
+            except Exception:
+                pass
+            last_displayed = seconds
+        next_change_at = deadline - (seconds - 1)
+        delay = max(0.05, min(remaining, next_change_at - clock()))
+        await sleep(delay)
+
+    try:
+        await _edit_wait_message(
+            chat_id,
+            wait_msg,
+            is_animation,
+            "✅ البحث متاح الآن، أرسل اسم المستخدم من جديد.",
+        )
+    except Exception:
+        pass
+
+
+async def _send_search_cooldown_message(message, remaining):
+    deadline = time.monotonic() + remaining
+    seconds = math.ceil(remaining)
+    caption = _search_cooldown_text(seconds)
+    try:
+        with open(LOADING_GIF_PATH, "rb") as animation:
+            wait_msg = await bot.send_animation(
+                chat_id=message.chat.id,
+                animation=animation,
+                caption=caption,
+                reply_to_message_id=message.message_id,
+            )
+        is_animation = "animation"
+    except Exception as exc:
+        print(f"Cooldown animation fallback: {type(exc).__name__}", flush=True)
+        wait_msg = await bot.reply_to(message, caption)
+        is_animation = False
+    await _run_search_cooldown_countdown(
+        message.chat.id,
+        wait_msg,
+        is_animation,
+        deadline,
+        initial_seconds=seconds,
+    )
+
+
+async def _show_search_cooldown_on_existing_message(
+    chat_id, wait_msg, is_animation, remaining
+):
+    deadline = time.monotonic() + remaining
+    seconds = math.ceil(remaining)
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=wait_msg.message_id, reply_markup=None
+        )
+    except Exception:
+        pass
+    try:
+        await _edit_wait_message(
+            chat_id, wait_msg, is_animation, _search_cooldown_text(seconds)
+        )
+    except Exception:
+        pass
+    await _run_search_cooldown_countdown(
+        chat_id,
+        wait_msg,
+        is_animation,
+        deadline,
+        initial_seconds=seconds,
     )
 
 
@@ -1302,7 +1395,7 @@ async def handle_username_message(message):
         user_id = f"chat:{message.chat.id}"
     cooldown = await _reserve_user_search(user_id)
     if cooldown:
-        await bot.reply_to(message, _search_cooldown_text(cooldown))
+        await _send_search_cooldown_message(message, cooldown)
         return
 
     wait_msg, is_animation = await _send_wait_message(message, username)
@@ -1336,8 +1429,13 @@ async def retry_lookup_callback(call):
         user_id = f"chat:{chat_id}"
     cooldown = await _reserve_user_search(user_id)
     if cooldown:
-        await bot.answer_callback_query(
-            call.id, text=_search_cooldown_text(cooldown)
+        await bot.answer_callback_query(call.id)
+        if _progress_animation_file_id(message):
+            is_animation = "rich" if getattr(message, "rich_message", None) else "animation"
+        else:
+            is_animation = False
+        await _show_search_cooldown_on_existing_message(
+            chat_id, message, is_animation, cooldown
         )
         return
 
