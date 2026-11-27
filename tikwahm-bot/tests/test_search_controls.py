@@ -216,12 +216,16 @@ class SearchControlsTests(unittest.TestCase):
         markup = send_rich.await_args.kwargs["reply_markup"]
         country_button = markup.keyboard[0][0]
         followers_button = markup.keyboard[1][0]
+        following_button = markup.keyboard[1][1]
         self.assertEqual(country_button.text, "دولة الحساب الأصلية")
         self.assertTrue(country_button.callback_data.startswith("country:"))
         self.assertEqual(followers_button.text, "قائمة المتابعين")
         self.assertTrue(followers_button.callback_data.startswith("followers:"))
+        self.assertEqual(following_button.text, "قائمة اللي يتابعهم")
+        self.assertTrue(following_button.callback_data.startswith("following:"))
         lookup_id = country_button.callback_data.removeprefix("country:")
         self.assertEqual(followers_button.callback_data, f"followers:{lookup_id}")
+        self.assertEqual(following_button.callback_data, f"following:{lookup_id}")
         self.assertEqual(
             self.arun(bot._get_country_lookup(lookup_id))["country"],
             "كندا — Canada 🇨🇦 — المصدر: FinTok",
@@ -243,6 +247,8 @@ class SearchControlsTests(unittest.TestCase):
         self.assertEqual(len(markup.keyboard), 1)
         self.assertEqual(markup.keyboard[0][0].text, "قائمة المتابعين")
         self.assertTrue(markup.keyboard[0][0].callback_data.startswith("followers:"))
+        self.assertEqual(markup.keyboard[0][1].text, "قائمة اللي يتابعهم")
+        self.assertTrue(markup.keyboard[0][1].callback_data.startswith("following:"))
 
     def test_country_name_resolves_to_a_real_png_flag_url(self):
         self.assertEqual(
