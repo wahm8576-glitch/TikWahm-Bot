@@ -1,6 +1,8 @@
 import asyncio
+import json
 import os
 import sys
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +18,7 @@ class ProxyRotationTests(unittest.TestCase):
         self.original_pool = bot._PROXY_POOL
         self.original_index = bot._ACTIVE_PROXY_INDEX
         self.original_lock = bot._PROXY_LOCK
-        self.original_semaphore = bot._BROWSER_SEMAPHORE
+        self.original_semaphore = bot._SOURCE_SEMAPHORE
         self.original_fetch_once = bot._fetch_once_through_proxy
         bot._PROXY_POOL = [
             {
@@ -29,13 +31,13 @@ class ProxyRotationTests(unittest.TestCase):
         ]
         bot._ACTIVE_PROXY_INDEX = 0
         bot._PROXY_LOCK = asyncio.Lock()
-        bot._BROWSER_SEMAPHORE = asyncio.Semaphore(1)
+        bot._SOURCE_SEMAPHORE = asyncio.Semaphore(3)
 
     def tearDown(self):
         bot._PROXY_POOL = self.original_pool
         bot._ACTIVE_PROXY_INDEX = self.original_index
         bot._PROXY_LOCK = self.original_lock
-        bot._BROWSER_SEMAPHORE = self.original_semaphore
+        bot._SOURCE_SEMAPHORE = self.original_semaphore
         bot._fetch_once_through_proxy = self.original_fetch_once
 
     @staticmethod
@@ -100,6 +102,95 @@ class ProxyRotationTests(unittest.TestCase):
             self.assertEqual(self._run(bot.fetch_data_from_tikip("second")), "ok")
 
         self.assertEqual(seen, ["proxy-0", "proxy-1"])
+
+
+class DirectTikipRequestTests(unittest.TestCase):
+    proxy = {
+        "host": "proxy.example",
+        "port": 8080,
+        "username": "test-user",
+        "password": "test-pass",
+    }
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self, _limit):
+            return json.dumps(self.payload).encode("utf-8")
+
+    class FakeOpener:
+        def __init__(self, payload):
+            self.payload = payload
+            self.request = None
+            self.timeout = None
+
+        def open(self, request, timeout):
+            self.request = request
+            self.timeout = timeout
+            return DirectTikipRequestTests.FakeResponse(self.payload)
+
+    def test_fetches_json_endpoint_directly_through_proxy(self):
+        payload = {
+            "status": "success",
+            "data": {
+                "user": {"uniqueId": "tiktok", "nickname": "TikTok", "id": "123"},
+                "stats": {"followerCount": 1, "heartCount": 2, "videoCount": 3},
+            },
+        }
+        opener = self.FakeOpener(payload)
+        with patch.object(bot.urllib.request, "build_opener", return_value=opener):
+            result = ProxyRotationTests._run(
+                bot._fetch_once_through_proxy("tiktok", self.proxy)
+            )
+
+        self.assertIn("/api/v1/profile?username=tiktok", opener.request.full_url)
+        self.assertEqual(opener.timeout, bot.SOURCE_TIMEOUT_SECONDS)
+        self.assertIn("TikTok", result["text"])
+
+    def test_http_throttle_is_marked_retryable(self):
+        class ThrottledOpener:
+            def open(self, request, timeout):
+                raise urllib.error.HTTPError(
+                    request.full_url, 429, "Too Many Requests", {}, None
+                )
+
+        with patch.object(
+            bot.urllib.request, "build_opener", return_value=ThrottledOpener()
+        ):
+            with self.assertRaises(bot._TikipRequestRejected):
+                bot._request_tikip_payload("tiktok", self.proxy)
+
+    def test_proxy_timeout_and_connection_error_are_classified_for_rotation(self):
+        class FailingOpener:
+            def __init__(self, reason):
+                self.reason = reason
+
+            def open(self, _request, timeout):
+                raise urllib.error.URLError(self.reason)
+
+        cases = [
+            (TimeoutError("timed out"), bot._TikipAttemptTimedOut),
+            (ConnectionRefusedError("connection refused"), bot._ProxyConnectionBroken),
+        ]
+        for reason, expected_error in cases:
+            with self.subTest(expected_error=expected_error.__name__):
+                with patch.object(
+                    bot.urllib.request,
+                    "build_opener",
+                    return_value=FailingOpener(reason),
+                ):
+                    with self.assertRaises(expected_error):
+                        bot._request_tikip_payload("tiktok", self.proxy)
 
 
 if __name__ == "__main__":

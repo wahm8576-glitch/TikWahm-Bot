@@ -10,7 +10,8 @@ import json
 import os
 import re
 import secrets
-import shutil
+import socket
+import urllib.error
 import urllib.request
 from pathlib import Path
 import time
@@ -32,7 +33,6 @@ except ImportError:  # Firebase is optional for local/mock runs.
 
 from telebot import asyncio_helper, types
 from telebot.async_telebot import AsyncTeleBot
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
@@ -47,8 +47,9 @@ TIKIP_API_URL = "https://shinyfrydgdghfdgdgmouse-a6de.issam1996kech.workers.dev/
 MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
-# Cap each proxy attempt so the background lookup has time to rotate through the pool.
-SOURCE_TIMEOUT_MILLISECONDS = 30_000
+# Query Tikip's JSON endpoint directly; a short per-proxy timeout keeps lookups responsive.
+SOURCE_TIMEOUT_SECONDS = 8
+MAX_SOURCE_RESPONSE_BYTES = 1_000_000
 PROGRESS_ANIMATION_INTERVAL = 1.0
 LOADING_GIF_PATH = os.path.join(os.path.dirname(__file__), "tikwahm_loading.gif")
 PROGRESS_MEDIA_ID = "tikwahm_loading"
@@ -58,7 +59,7 @@ _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
 _SEEN_WEBHOOK_UPDATE_IDS = OrderedDict()
 _WEBHOOK_UPDATE_ID_CACHE_LIMIT = 4096
-_BROWSER_SEMAPHORE = asyncio.Semaphore(1)
+_SOURCE_SEMAPHORE = asyncio.Semaphore(3)
 
 FIELD_LABELS = {
     "ESTIMATED CURRENT REGION": "country",
@@ -550,29 +551,6 @@ _PROXY_POOL = _load_proxy_pool(PROXY_LIST_PATH)
 _ACTIVE_PROXY_INDEX = 0
 _PROXY_LOCK = asyncio.Lock()
 
-_CONNECTION_FAILURE_MARKERS = (
-    "err_proxy_connection_failed",
-    "err_tunnel_connection_failed",
-    "err_connection_closed",
-    "err_connection_reset",
-    "err_connection_refused",
-    "err_connection_timed_out",
-    "err_timed_out",
-    "err_name_not_resolved",
-    "err_name_resolution_failed",
-    "err_socks_connection_failed",
-    "err_internet_disconnected",
-    "err_network_changed",
-    "err_address_unreachable",
-    "econnreset",
-    "econnrefused",
-    "ehostunreach",
-    "enetunreach",
-    "network is unreachable",
-    "connection reset",
-    "connection refused",
-    "connection timed out",
-)
 _PROVIDER_DENIAL_MARKERS = (
     "captcha",
     "i'm not a robot",
@@ -615,20 +593,7 @@ class _TikipRequestRejected(_RetryableTikipError):
 
 
 class _TikipAttemptTimedOut(_RetryableTikipError):
-    """Raised when a page load or source request times out."""
-
-
-def _is_connection_failure(error_or_text) -> bool:
-    text = str(error_or_text or "").casefold()
-    return any(marker in text for marker in _CONNECTION_FAILURE_MARKERS)
-
-
-def _proxy_launch_config(proxy):
-    return {
-        "server": f"http://{proxy['host']}:{proxy['port']}",
-        "username": proxy["username"],
-        "password": proxy["password"],
-    }
+    """Raised when a direct Tikip API request times out."""
 
 
 async def _get_next_proxy():
@@ -643,169 +608,78 @@ async def _get_next_proxy():
         return _PROXY_POOL[current_index], current_index
 
 
-async def _page_shows_provider_restriction(page, denied_statuses) -> bool:
-    if any(status in {401, 403, 429} for status in denied_statuses):
-        return True
+def _request_tikip_payload(username: str, proxy):
+    """Request Tikip's JSON API through one proxy without loading its website."""
+    proxy_url = (
+        f"http://{quote(proxy['username'], safe='')}:{quote(proxy['password'], safe='')}"
+        f"@{proxy['host']}:{proxy['port']}"
+    )
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+    endpoint = f"{TIKIP_API_URL}?username={quote(username, safe='')}"
+    request = urllib.request.Request(
+        endpoint,
+        headers={
+            "Accept": "application/json",
+            "Cache-Control": "no-cache",
+            "Origin": TIKIP_URL.rstrip("/"),
+            "Referer": TIKIP_URL,
+            "User-Agent": "Mozilla/5.0 (compatible; TikWahm/1.0)",
+        },
+    )
+
     try:
-        challenge = page.locator(
-            'iframe[src*="captcha" i], iframe[src*="challenge" i], '
-            '[class*="captcha" i], [id*="captcha" i]'
-        )
-        for index in range(min(await challenge.count(), 5)):
-            if await challenge.nth(index).is_visible():
-                return True
-    except Exception:
-        pass
+        with opener.open(request, timeout=SOURCE_TIMEOUT_SECONDS) as response:
+            status = response.getcode()
+            raw_body = response.read(MAX_SOURCE_RESPONSE_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        exc.close()
+        if exc.code in {401, 403, 429}:
+            raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
+        raise _TikipRequestRejected(f"Tikip HTTP {exc.code}") from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise _TikipAttemptTimedOut from exc
+    except urllib.error.URLError as exc:
+        reason = exc.reason
+        reason_text = str(reason or exc).casefold()
+        if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in reason_text:
+            raise _TikipAttemptTimedOut from exc
+        raise _ProxyConnectionBroken from exc
+    except OSError as exc:
+        if "timed out" in str(exc).casefold():
+            raise _TikipAttemptTimedOut from exc
+        raise _ProxyConnectionBroken from exc
+
+    if not isinstance(status, int) or status < 200 or status >= 300:
+        raise _TikipRequestRejected(f"Tikip HTTP {status}")
+    if len(raw_body) > MAX_SOURCE_RESPONSE_BYTES:
+        raise _TikipRequestRejected("Tikip returned an oversized response")
     try:
-        body = (await page.locator("body").inner_text(timeout=2500)).casefold()
-    except Exception:
-        body = ""
-    return any(marker in body for marker in _PROVIDER_DENIAL_MARKERS)
+        payload = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _TikipRequestRejected("Tikip returned an invalid response") from exc
+    if not isinstance(payload, dict):
+        raise _TikipRequestRejected("Tikip returned an invalid response")
+    return payload
 
 
 async def _fetch_once_through_proxy(username: str, proxy, progress=None):
-    """Perform one lookup through one proxy."""
-    browser = None
-    source_hosts = {
-        (urlparse(TIKIP_URL).hostname or "").casefold(),
-        (urlparse(TIKIP_API_URL).hostname or "").casefold(),
-    }
-    denied_statuses = []
-    connection_failures = []
-    try:
-        _set_progress(progress, "تهيئة البحث")
-        async with async_playwright() as p:
-            options = {"headless": True}
-            if proxy:
-                options["proxy"] = _proxy_launch_config(proxy)
-            executable = (
-                os.environ.get("PLAYWRIGHT_CHROMIUM_EXECUTABLE")
-                or shutil.which("chromium")
-                or shutil.which("chromium-browser")
-                or shutil.which("google-chrome")
-            )
-            if executable:
-                options["executable_path"] = executable
-            if os.name == "posix":
-                options["args"] = ["--no-sandbox"]
+    """Fetch a single JSON result through a proxy without launching a browser."""
+    _set_progress(progress, "البحث عن الحساب وجمع بياناته")
+    payload = await asyncio.to_thread(_request_tikip_payload, username, proxy)
+    if str(payload.get("status", "")).casefold() == "error":
+        payload_text = json.dumps(payload, ensure_ascii=False).casefold()
+        if any(marker in payload_text for marker in _PROVIDER_DENIAL_MARKERS):
+            raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
+        return str(
+            payload.get("message")
+            or payload.get("error")
+            or "لم يعثر المصدر على بيانات عامة للحساب."
+        )
 
-            browser = await p.chromium.launch(**options)
-            _set_progress(progress, "فتح مصدر البيانات")
-            page = await browser.new_page()
-
-            def record_response(response):
-                try:
-                    response_host = (urlparse(response.url).hostname or "").casefold()
-                    if response_host in source_hosts and response.status in {401, 403, 429}:
-                        denied_statuses.append(response.status)
-                except Exception:
-                    pass
-
-            def record_failed_request(request):
-                try:
-                    request_host = (urlparse(request.url).hostname or "").casefold()
-                    relevant_type = request.resource_type in {"document", "xhr", "fetch"}
-                    if (request_host in source_hosts and relevant_type
-                            and _is_connection_failure(request.failure or "")):
-                        connection_failures.append(True)
-                except Exception:
-                    pass
-
-            page.on("response", record_response)
-            page.on("requestfailed", record_failed_request)
-
-            try:
-                await page.goto(
-                    TIKIP_URL,
-                    wait_until="domcontentloaded",
-                    timeout=SOURCE_TIMEOUT_MILLISECONDS,
-                )
-            except Exception as exc:
-                if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
-                if isinstance(exc, (PlaywrightTimeoutError, asyncio.TimeoutError)):
-                    raise _TikipAttemptTimedOut from exc
-                if _is_connection_failure(exc) or connection_failures:
-                    raise _ProxyConnectionBroken from exc
-                raise
-
-            if await _page_shows_provider_restriction(page, denied_statuses):
-                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
-
-            _set_progress(progress, "البحث عن الحساب وجمع بياناته")
-            try:
-                api_result = await page.evaluate(
-                    """async ({endpoint, username, timeoutMs}) => {
-                        const controller = new AbortController();
-                        const timer = setTimeout(() => controller.abort(), timeoutMs);
-                        try {
-                            const response = await fetch(
-                                endpoint + '?username=' + encodeURIComponent(username),
-                                { signal: controller.signal, cache: 'no-store' }
-                            );
-                            let body = null;
-                            try { body = await response.json(); } catch (_) {}
-                            return { status: response.status, body };
-                        } catch (error) {
-                            return { error: error && error.message ? error.message : 'NetworkError' };
-                        } finally {
-                            clearTimeout(timer);
-                        }
-                    }""",
-                    {
-                        "endpoint": TIKIP_API_URL,
-                        "username": username,
-                        "timeoutMs": SOURCE_TIMEOUT_MILLISECONDS,
-                    },
-                )
-            except Exception as exc:
-                if denied_statuses or await _page_shows_provider_restriction(page, denied_statuses):
-                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE) from exc
-                if isinstance(exc, (PlaywrightTimeoutError, asyncio.TimeoutError)):
-                    raise _TikipAttemptTimedOut from exc
-                if _is_connection_failure(exc) or connection_failures:
-                    raise _ProxyConnectionBroken from exc
-                raise
-
-            if await _page_shows_provider_restriction(page, denied_statuses):
-                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
-
-            if not isinstance(api_result, dict):
-                if connection_failures:
-                    raise _ProxyConnectionBroken
-                return "تعذر قراءة رد مصدر البيانات. جرّب مرة أخرى لاحقًا."
-            if api_result.get("error"):
-                if connection_failures:
-                    raise _ProxyConnectionBroken
-                if "abort" in str(api_result["error"]).casefold():
-                    raise _TikipAttemptTimedOut(str(api_result["error"]))
-                raise _ProxyConnectionBroken(str(api_result["error"]))
-
-            status = api_result.get("status")
-            if status in {401, 403, 429}:
-                raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
-            if not isinstance(status, int) or status < 200 or status >= 300:
-                if connection_failures:
-                    raise _ProxyConnectionBroken
-                raise _TikipRequestRejected(f"Tikip HTTP {status}")
-
-            payload = api_result.get("body")
-            if not isinstance(payload, dict):
-                raise _TikipRequestRejected("Tikip returned an invalid response")
-            if payload.get("status") == "error":
-                payload_text = json.dumps(payload, ensure_ascii=False).casefold()
-                if any(marker in payload_text for marker in _PROVIDER_DENIAL_MARKERS):
-                    raise _TikipRequestRejected(_PROVIDER_RESTRICTION_MESSAGE)
-                return str(payload.get("message") or payload.get("error") or "لم يعثر المصدر على بيانات عامة للحساب.")
-
-            _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
-            return format_tikip_api_result(username, payload)
-    finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
+    _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
+    return format_tikip_api_result(username, payload)
 
 
 async def fetch_data_from_tikip(username: str, progress=None):
@@ -823,20 +697,38 @@ async def fetch_data_from_tikip(username: str, progress=None):
         proxy, proxy_index = await _get_next_proxy()
         if proxy is None:
             break
+        attempt_started = time.monotonic()
         try:
-            async with _BROWSER_SEMAPHORE:
+            async with _SOURCE_SEMAPHORE:
                 result = await _fetch_once_through_proxy(username, proxy, progress)
+            print(
+                f"Proxy slot #{proxy_index + 1} completed Tikip JSON request in "
+                f"{time.monotonic() - attempt_started:.2f}s.",
+                flush=True,
+            )
             return result
         except _ProxyConnectionBroken:
-            print(f"Proxy slot #{proxy_index + 1} failed to connect; rotating to next...", flush=True)
+            print(
+                f"Proxy slot #{proxy_index + 1} failed to connect after "
+                f"{time.monotonic() - attempt_started:.2f}s; rotating to next...",
+                flush=True,
+            )
             continue
-        except (_TikipAttemptTimedOut, PlaywrightTimeoutError, asyncio.TimeoutError):
+        except (_TikipAttemptTimedOut, asyncio.TimeoutError, TimeoutError):
             saw_timeout = True
-            print(f"Proxy slot #{proxy_index + 1} timed out; rotating to next...", flush=True)
+            print(
+                f"Proxy slot #{proxy_index + 1} timed out after "
+                f"{time.monotonic() - attempt_started:.2f}s; rotating to next...",
+                flush=True,
+            )
             continue
         except _TikipRequestRejected:
             saw_rejection = True
-            print(f"Proxy slot #{proxy_index + 1} was rejected by Tikip; rotating to next...", flush=True)
+            print(
+                f"Proxy slot #{proxy_index + 1} was rejected by Tikip after "
+                f"{time.monotonic() - attempt_started:.2f}s; rotating to next...",
+                flush=True,
+            )
             continue
         except Exception as exc:
             return (
