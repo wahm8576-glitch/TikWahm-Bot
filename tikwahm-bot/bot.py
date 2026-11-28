@@ -1848,41 +1848,141 @@ async def _process_tiktok_video_message(message, url):
 
 @bot.message_handler(commands=["start", "help"])
 async def send_welcome(message):
-    rich_message = {
+    user = getattr(message, "from_user", None)
+    await _send_welcome_menu(
+        message.chat.id,
+        user,
+        reply_to_message_id=getattr(message, "message_id", None),
+    )
+
+
+_USER_LANGUAGE_OVERRIDES = {}
+
+_WELCOME_COPY = {
+    "ar": {
+        "greeting": "• مرحباً °~ {name}° في بوت معلومات تيك توك 🤖",
+        "description": (
+            "بوت متقدم يوفر مجموعة قوية من أدوات TikTok، ويتيح لك استخراج المعلومات العامة "
+            "والمتقدمة للحسابات، وتحميل الفيديوهات والصور والستوري والموسيقى، واستخدام أدوات "
+            "إدارة الحساب، إضافة إلى خدمات التفاعل مثل زيادة المشاهدات والمتابعين والإعجابات، "
+            "مع نظام بحث متكامل عبر اليوزر أو الرقم أو البريد أو الـ ID."
+        ),
+        "send": "أرسل يوزر أو رابط مقطع.",
+        "sections": "يمكنك استخدام الأقسام من الأزرار بالأسفل.",
+        "private": "القسم الخاص",
+        "download": "قسم التحميل",
+        "search": "قسم البحث",
+        "arabic": "العربية",
+        "english": "English",
+    },
+    "en": {
+        "greeting": "• Welcome °~ {name}° to the TikTok Info Bot 🤖",
+        "description": (
+            "An advanced bot with a powerful set of TikTok tools. Get public and advanced "
+            "account information, download videos, photos, stories, and music, use account "
+            "management tools, and access engagement services such as increasing views, "
+            "followers, and likes—with integrated search by username, phone number, email, or ID."
+        ),
+        "send": "Send a username or a video link.",
+        "sections": "Use the sections from the buttons below.",
+        "private": "Private Section",
+        "download": "Download Section",
+        "search": "Search Section",
+        "arabic": "العربية",
+        "english": "English",
+    },
+}
+
+_DOWNLOAD_COPY = {
+    "ar": {
+        "text": (
+            "مرحباً بك في قسم التحميل\n\n"
+            "يمكنك من خلال هذا القسم تحميل محتوى تيك توك بكل سهولة وبشكل مجهول."
+        ),
+        "photos": "تحميل صور",
+        "stories": "تحميل الستوري",
+        "video": "تحميل الفيديو",
+        "back": "رجوع",
+    },
+    "en": {
+        "text": (
+            "Welcome to the Download Section\n\n"
+            "Use this section to download TikTok content easily and anonymously."
+        ),
+        "photos": "Download Photos",
+        "stories": "Download Stories",
+        "video": "Download Video",
+        "back": "Back",
+    },
+}
+
+
+def _user_language(user):
+    user_id = getattr(user, "id", None)
+    saved = _USER_LANGUAGE_OVERRIDES.get(user_id)
+    if saved in _WELCOME_COPY:
+        return saved
+    language_code = str(getattr(user, "language_code", "") or "").lower().split("-", 1)[0]
+    return language_code if language_code in _WELCOME_COPY else "ar"
+
+
+def _rich_buttons_block(*buttons):
+    return {"type": "buttons", "align": "center", "buttons": list(buttons)}
+
+
+def _rich_button(text, callback_data, style="primary"):
+    return {"text": text, "style": style, "callback_data": callback_data}
+
+
+def _welcome_rich_message(user, language):
+    language = language if language in _WELCOME_COPY else "ar"
+    copy = _WELCOME_COPY[language]
+    name = str(getattr(user, "first_name", "") or "").strip()
+    name = name or ("friend" if language == "en" else "صديق")
+    return {
         "blocks": [
-            {
-                "type": "paragraph",
-                "text": (
-                    "أرسل اسم مستخدم TikTok عامًا مثل @username أو رابط الملف، "
-                    "وسأبحث عن معلومات الحساب وإحصاءاته. استخدم /terms لشروط كشف الدولة، "
-                    "و /support للدعم، و /subscription لإدارة اشتراكك."
-                ),
-            },
-            {
-                "type": "paragraph",
-                "text": "📥 لتنزيل فيديوهات TikTok، اضغط الزر أدناه ثم أرسل رابط فيديو TikTok للتحميل.",
-            },
-            {
-                "type": "buttons",
-                "align": "center",
-                "buttons": [
-                    {
-                        "text": "تحميل فيديوهات تيك توك",
-                        "style": "primary",
-                        "callback_data": "video:download",
-                    }
-                ],
-            },
+            {"type": "paragraph", "text": copy["greeting"].format(name=name)},
+            {"type": "paragraph", "text": copy["description"]},
+            {"type": "paragraph", "text": copy["send"]},
+            {"type": "paragraph", "text": copy["sections"]},
+            _rich_buttons_block(_rich_button(copy["private"], "menu:private")),
+            _rich_buttons_block(
+                _rich_button(copy["download"], "menu:download"),
+                _rich_button(copy["search"], "menu:search"),
+            ),
+            _rich_buttons_block(
+                _rich_button(copy["arabic"], "lang:ar"),
+                _rich_button(copy["english"], "lang:en"),
+            ),
         ],
-        "is_rtl": True,
+        "is_rtl": language == "ar",
     }
+
+
+def _download_rich_message(language):
+    language = language if language in _DOWNLOAD_COPY else "ar"
+    copy = _DOWNLOAD_COPY[language]
+    return {
+        "blocks": [
+            {"type": "paragraph", "text": copy["text"]},
+            _rich_buttons_block(
+                _rich_button(copy["photos"], "download:photos"),
+                _rich_button(copy["stories"], "download:stories"),
+            ),
+            _rich_buttons_block(_rich_button(copy["video"], "download:video")),
+            _rich_buttons_block(_rich_button(copy["back"], "menu:home")),
+        ],
+        "is_rtl": language == "ar",
+    }
+
+
+async def _send_rich_menu(chat_id, rich_message, reply_to_message_id=None):
     params = {
-        "chat_id": message.chat.id,
+        "chat_id": chat_id,
         "rich_message": json.dumps(rich_message, ensure_ascii=False),
     }
-    message_id = getattr(message, "message_id", None)
-    if message_id is not None:
-        params["reply_parameters"] = json.dumps({"message_id": message_id})
+    if reply_to_message_id is not None:
+        params["reply_parameters"] = json.dumps({"message_id": reply_to_message_id})
     await asyncio.to_thread(
         apihelper._make_request,
         BOT_TOKEN,
@@ -1892,17 +1992,131 @@ async def send_welcome(message):
     )
 
 
-@bot.callback_query_handler(func=lambda call: (call.data or "") == "video:download")
+async def _send_welcome_menu(chat_id, user, reply_to_message_id=None, language=None):
+    language = language or _user_language(user)
+    await _send_rich_menu(
+        chat_id,
+        _welcome_rich_message(user, language),
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("menu:")))
+async def menu_section_callback(call):
+    await bot.answer_callback_query(call.id)
+    message = call.message
+    user = getattr(call, "from_user", None)
+    language = _user_language(user)
+    action = (call.data or "").removeprefix("menu:")
+    reply_to_message_id = getattr(message, "message_id", None)
+    if action == "home":
+        await _send_welcome_menu(
+            message.chat.id, user, reply_to_message_id=reply_to_message_id, language=language
+        )
+        return
+    if action == "download":
+        await _send_rich_menu(
+            message.chat.id,
+            _download_rich_message(language),
+            reply_to_message_id=reply_to_message_id,
+        )
+        return
+
+    if language == "en":
+        if action == "private":
+            text = (
+                "The private section keeps the account tools already available in search results. "
+                "Search for an account to access its original-country and follower-list buttons, "
+                "when available."
+            )
+            buttons = [_rich_buttons_block(_rich_button("Search Section", "menu:search"))]
+        elif action == "search":
+            text = "Send a TikTok username or profile link to search for account information."
+            buttons = []
+        else:
+            return
+        back_text = "Back"
+    else:
+        if action == "private":
+            text = (
+                "يضم القسم الخاص أدوات الحساب المتاحة أصلًا ضمن نتائج البحث. ابحث عن حساب للوصول "
+                "إلى أزرار الدولة الأصلية وقوائم المتابعين عند توفرها."
+            )
+            buttons = [_rich_buttons_block(_rich_button("قسم البحث", "menu:search"))]
+        elif action == "search":
+            text = "أرسل يوزر TikTok أو رابط الحساب للبحث عن معلوماته."
+            buttons = []
+        else:
+            return
+        back_text = "رجوع"
+
+    buttons.append(_rich_buttons_block(_rich_button(back_text, "menu:home")))
+    await _send_rich_menu(
+        message.chat.id,
+        {"blocks": [{"type": "paragraph", "text": text}, *buttons], "is_rtl": language == "ar"},
+        reply_to_message_id=reply_to_message_id,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: bool(call.data and call.data.startswith("lang:")))
+async def language_callback(call):
+    language = (call.data or "").removeprefix("lang:")
+    if language not in _WELCOME_COPY:
+        await bot.answer_callback_query(call.id, text="Unsupported language." if language == "en" else "لغة غير مدعومة.")
+        return
+    user = getattr(call, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        _USER_LANGUAGE_OVERRIDES[user_id] = language
+    await bot.answer_callback_query(call.id)
+    message = call.message
+    await _send_welcome_menu(
+        message.chat.id,
+        user,
+        reply_to_message_id=getattr(message, "message_id", None),
+        language=language,
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data and call.data in {"download:photos", "download:stories"})
+)
+async def unavailable_download_callback(call):
+    language = _user_language(getattr(call, "from_user", None))
+    text = (
+        "Photo and story downloads are not available yet. Use Download Video in the Download Section."
+        if language == "en"
+        else "تحميل الصور والستوري غير متاح حاليًا. استخدم زر تحميل الفيديو في قسم التحميل."
+    )
+    await bot.answer_callback_query(call.id, text=text, show_alert=True)
+
+
+@bot.callback_query_handler(
+    func=lambda call: bool(call.data and call.data in {"download:video", "video:download"})
+)
 async def request_tiktok_video_link(call):
     await bot.answer_callback_query(call.id)
     message = call.message
+    if (call.data or "") == "video:download":
+        await _send_rich_menu(
+            message.chat.id,
+            _download_rich_message(_user_language(getattr(call, "from_user", None))),
+            reply_to_message_id=getattr(message, "message_id", None),
+        )
+        return
     chat_id = message.chat.id
+    language = _user_language(getattr(call, "from_user", None))
+    prompt_text = (
+        "Send a public TikTok video link to download. Example:\nhttps://vm.tiktok.com/…"
+        if language == "en"
+        else "أرسل رابط فيديو TikTok العام للتحميل الآن. مثال:\nhttps://vm.tiktok.com/…"
+    )
     prompt = await bot.send_message(
         chat_id=chat_id,
-        text="أرسل رابط فيديو TikTok العام للتحميل الآن. مثال:\nhttps://vm.tiktok.com/…",
+        text=prompt_text,
         reply_markup=types.ForceReply(
             selective=True,
-            input_field_placeholder="رابط فيديو TikTok",
+            input_field_placeholder=("TikTok video link" if language == "en" else "رابط فيديو TikTok"),
         ),
         reply_to_message_id=message.message_id,
     )
@@ -2370,7 +2584,15 @@ async def handle_username_message(message):
     if video_url:
         if pending_video_key is not None:
             _TIKTOK_DOWNLOAD_PENDING.pop(pending_video_key, None)
-        await _process_tiktok_video_message(message, video_url)
+            await _process_tiktok_video_message(message, video_url)
+        else:
+            language = _user_language(getattr(message, "from_user", None))
+            text = (
+                "To download a video, open the Download Section and press Download Video first."
+                if language == "en"
+                else "لتحميل الفيديو، افتح قسم التحميل واضغط «تحميل الفيديو» أولًا."
+            )
+            await bot.reply_to(message, text)
         return
     if pending_video_key is not None:
         await bot.reply_to(

@@ -51,12 +51,15 @@ class TikTokVideoDownloadTests(unittest.TestCase):
     def setUp(self):
         self.saved_pending = bot._TIKTOK_DOWNLOAD_PENDING
         self.saved_active = bot._TIKTOK_DOWNLOAD_ACTIVE
+        self.saved_languages = bot._USER_LANGUAGE_OVERRIDES
         bot._TIKTOK_DOWNLOAD_PENDING = {}
         bot._TIKTOK_DOWNLOAD_ACTIVE = set()
+        bot._USER_LANGUAGE_OVERRIDES = {}
 
     def tearDown(self):
         bot._TIKTOK_DOWNLOAD_PENDING = self.saved_pending
         bot._TIKTOK_DOWNLOAD_ACTIVE = self.saved_active
+        bot._USER_LANGUAGE_OVERRIDES = self.saved_languages
 
     @staticmethod
     def arun(awaitable):
@@ -68,7 +71,7 @@ class TikTokVideoDownloadTests(unittest.TestCase):
             text=text,
             message_id=101,
             chat=SimpleNamespace(id=chat_id, type="private"),
-            from_user=SimpleNamespace(id=user_id),
+            from_user=SimpleNamespace(id=user_id, first_name="Test User", language_code="ar"),
         )
 
     def test_extracts_tiktok_short_and_full_video_links_only(self):
@@ -123,7 +126,7 @@ class TikTokVideoDownloadTests(unittest.TestCase):
                 bot._download_tiktok_media("https://v16m.tiktokcdn-us.com/video.mp4")
         self.assertEqual(response.stream.tell(), 0)
 
-    def test_welcome_includes_clear_video_download_button_and_instruction(self):
+    def test_welcome_has_personalized_arabic_copy_and_requested_button_rows(self):
         message = self.message()
         with patch.object(bot.apihelper, "_make_request", return_value={"message_id": 202}) as request:
             self.arun(bot.send_welcome(message))
@@ -133,18 +136,65 @@ class TikTokVideoDownloadTests(unittest.TestCase):
         self.assertEqual(json.loads(params["reply_parameters"]), {"message_id": 101})
         rich_message = json.loads(params["rich_message"])
         self.assertTrue(rich_message["is_rtl"])
-        self.assertIn("أرسل رابط فيديو TikTok للتحميل", rich_message["blocks"][1]["text"])
-        button_block = rich_message["blocks"][2]
-        self.assertEqual(button_block["type"], "buttons")
-        self.assertEqual(button_block["align"], "center")
-        button = button_block["buttons"][0]
-        self.assertEqual(button["text"], "تحميل فيديوهات تيك توك")
-        self.assertEqual(button["callback_data"], "video:download")
-        self.assertEqual(button["style"], "primary")
+        paragraphs = [block["text"] for block in rich_message["blocks"] if block["type"] == "paragraph"]
+        self.assertEqual(paragraphs[0], "• مرحباً °~ Test User° في بوت معلومات تيك توك 🤖")
+        self.assertEqual(paragraphs[1], bot._WELCOME_COPY["ar"]["description"])
+        self.assertEqual(paragraphs[2:], ["أرسل يوزر أو رابط مقطع.", "يمكنك استخدام الأقسام من الأزرار بالأسفل."])
+        rows = [block["buttons"] for block in rich_message["blocks"] if block["type"] == "buttons"]
+        self.assertEqual(
+            [[button["text"] for button in row] for row in rows],
+            [["القسم الخاص"], ["قسم التحميل", "قسم البحث"], ["العربية", "English"]],
+        )
+        self.assertEqual(
+            [[button["callback_data"] for button in row] for row in rows],
+            [["menu:private"], ["menu:download", "menu:search"], ["lang:ar", "lang:en"]],
+        )
+
+    def test_download_section_has_photos_and_stories_then_video_then_back(self):
+        call = SimpleNamespace(
+            id="callback-download",
+            data="menu:download",
+            from_user=SimpleNamespace(id=505, language_code="ar"),
+            message=SimpleNamespace(message_id=202, chat=SimpleNamespace(id=505, type="private")),
+        )
+        with patch.object(bot.bot, "answer_callback_query", new_callable=AsyncMock), patch.object(
+            bot.apihelper, "_make_request", return_value={"message_id": 303}
+        ) as request:
+            self.arun(bot.menu_section_callback(call))
+        rich_message = json.loads(request.call_args.kwargs["params"]["rich_message"])
+        paragraphs = [block["text"] for block in rich_message["blocks"] if block["type"] == "paragraph"]
+        self.assertEqual(paragraphs, [bot._DOWNLOAD_COPY["ar"]["text"]])
+        rows = [block["buttons"] for block in rich_message["blocks"] if block["type"] == "buttons"]
+        self.assertEqual(
+            [[button["text"] for button in row] for row in rows],
+            [["تحميل صور", "تحميل الستوري"], ["تحميل الفيديو"], ["رجوع"]],
+        )
+        self.assertEqual(
+            [[button["callback_data"] for button in row] for row in rows],
+            [["download:photos", "download:stories"], ["download:video"], ["menu:home"]],
+        )
+
+    def test_english_language_button_updates_menu_copy(self):
+        call = SimpleNamespace(
+            id="callback-language",
+            data="lang:en",
+            from_user=SimpleNamespace(id=505, first_name="Taylor", language_code="ar"),
+            message=SimpleNamespace(message_id=202, chat=SimpleNamespace(id=505, type="private")),
+        )
+        with patch.object(bot.bot, "answer_callback_query", new_callable=AsyncMock), patch.object(
+            bot.apihelper, "_make_request", return_value={"message_id": 303}
+        ) as request:
+            self.arun(bot.language_callback(call))
+        self.assertEqual(bot._USER_LANGUAGE_OVERRIDES[505], "en")
+        rich_message = json.loads(request.call_args.kwargs["params"]["rich_message"])
+        self.assertFalse(rich_message["is_rtl"])
+        self.assertEqual(rich_message["blocks"][0]["text"], "• Welcome °~ Taylor° to the TikTok Info Bot 🤖")
+        self.assertEqual(rich_message["blocks"][4]["buttons"][0]["text"], "Private Section")
 
     def test_button_callback_asks_for_link_and_tracks_clicking_user(self):
         call = SimpleNamespace(
             id="callback-1",
+            data="download:video",
             from_user=SimpleNamespace(id=505),
             message=SimpleNamespace(
                 message_id=202,
@@ -174,6 +224,18 @@ class TikTokVideoDownloadTests(unittest.TestCase):
         process_video.assert_awaited_once_with(message, "https://vm.tiktok.com/ZN8HD2jGK/")
         search.assert_not_awaited()
         self.assertNotIn(key, bot._TIKTOK_DOWNLOAD_PENDING)
+
+    def test_video_link_without_download_button_does_not_start_download(self):
+        message = self.message("https://vm.tiktok.com/ZN8HD2jGK/")
+        with patch.object(
+            bot, "_process_tiktok_video_message", new_callable=AsyncMock
+        ) as process_video, patch.object(
+            bot, "_start_username_search", new_callable=AsyncMock
+        ) as search, patch.object(bot.bot, "reply_to", new_callable=AsyncMock) as reply:
+            self.arun(bot.handle_username_message(message))
+        process_video.assert_not_awaited()
+        search.assert_not_awaited()
+        self.assertIn("قسم التحميل", reply.await_args.args[1])
 
     def test_processing_uploads_actual_mp4_as_video_and_finishes_progress(self):
         message = self.message("https://vm.tiktok.com/ZN8HD2jGK/")
