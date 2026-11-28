@@ -671,13 +671,19 @@ def _inline_public_profile(username, profile):
     if name:
         lines.append(f"الاسم: {name}")
     lines.extend([f"اسم المستخدم: @{handle}", "البيان | القيمة"])
-    for label, key in (("يتابع", "following"), ("المتابعون", "followers"), ("الإعجابات", "likes")):
-        value = _fintok_display_value(profile.get(key), compact_number=True)
+    rows = [
+        ("يتابع", _fintok_display_value(profile.get("following"), compact_number=True)),
+        ("المتابعون", _fintok_display_value(profile.get("followers"), compact_number=True)),
+        ("الإعجابات", _fintok_display_value(profile.get("likes"), compact_number=True)),
+        ("معرّف المستخدم", profile.get("userid")),
+        ("نوع الحساب", _fintok_account_type(profile.get("private"))),
+        ("اللغة", _fintok_language(profile.get("language"))),
+        ("وقت إنشاء الحساب", profile.get("created_time")),
+        ("آخر تغيير للاسم", profile.get("last_change_name")),
+    ]
+    for label, value in rows:
         if value is not None and value != "":
             lines.append(f"{label} | {' '.join(str(value).split())[:80]}")
-    account_type = _fintok_account_type(profile.get("private"))
-    if account_type is not None and account_type != "":
-        lines.append(f"نوع الحساب | {' '.join(str(account_type).split())[:80]}")
     return "\n".join(lines)
 
 

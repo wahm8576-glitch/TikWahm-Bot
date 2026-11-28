@@ -90,16 +90,36 @@ class InlineModeTests(unittest.TestCase):
     def test_allowlisted_profile_never_includes_sensitive_fields(self):
         profile = {
             "username": "sample", "fullname": "Public Name", "followers": 1234,
-            "following": 120, "likes": 500, "private": False,
+            "following": 120, "likes": 500, "private": False, "userid": "987654321",
+            "language": "en-US", "created_time": "2021-03-07 16:05:06",
+            "last_change_name": "2024-11-29 09:08:07",
             "original_country": "SECRET_COUNTRY", "security": "SECRET_SECURITY",
             "followers_list": ["SECRET_FOLLOWER"], "active_region": "SECRET_REGION",
+            "registered_region": "SECRET_REGISTERED_REGION", "secUid": "SECRET_SECUID",
+            "security_status": "SECRET_SECURITY_STATUS",
         }
         text = bot._inline_public_profile("sample", profile)
-        for token in ("SECRET_COUNTRY", "SECRET_SECURITY", "SECRET_FOLLOWER", "SECRET_REGION"):
+        for token in (
+            "SECRET_COUNTRY", "SECRET_SECURITY", "SECRET_FOLLOWER", "SECRET_REGION",
+            "SECRET_REGISTERED_REGION", "SECRET_SECUID", "SECRET_SECURITY_STATUS",
+        ):
             self.assertNotIn(token, text)
         self.assertIn("Public Name", text)
         self.assertIn("@sample", text)
         self.assertIn("المتابعون", text)
+        for expected in (
+            "يتابع | 120", "المتابعون | 1.23K", "الإعجابات | 500",
+            "معرّف المستخدم | 987654321", "نوع الحساب | عام (Public Account)",
+            "اللغة | الإنجليزية (en-US)", "وقت إنشاء الحساب | 2021-03-07 16:05:06",
+            "آخر تغيير للاسم | 2024-11-29 09:08:07",
+        ):
+            self.assertIn(expected, text)
+        ordered_labels = [
+            "يتابع", "المتابعون", "الإعجابات", "معرّف المستخدم", "نوع الحساب",
+            "اللغة", "وقت إنشاء الحساب", "آخر تغيير للاسم",
+        ]
+        positions = [text.index(label) for label in ordered_labels]
+        self.assertEqual(positions, sorted(positions))
 
     def test_invalid_query_does_not_start_a_lookup(self):
         query = self.query(text="sample name")
