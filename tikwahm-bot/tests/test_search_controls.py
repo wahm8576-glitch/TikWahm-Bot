@@ -87,16 +87,18 @@ class SearchControlsTests(unittest.TestCase):
     def lookup(country="كندا — Canada 🇨🇦 — المصدر: FinTok", username="sample"):
         return {"country": country, "username": username}
 
-    def test_progress_reaches_100_in_ten_seconds_and_stays_complete(self):
+    def test_progress_uses_moving_bar_after_estimated_ten_seconds(self):
         before_completion = bot._wait_progress_for_elapsed("sample", 9.9)
         completed = bot._wait_progress_for_elapsed("sample", 10)
+        next_frame = bot._wait_progress_for_elapsed("sample", 11)
         grace_period = bot._wait_progress_for_elapsed("sample", 14.9)
 
         self.assertIn("٩٩٪", before_completion)
-        self.assertIn("١٠٠٪", completed)
-        self.assertIn("١٠٠٪", grace_period)
+        self.assertIn("بحث معلومات الحساب", before_completion)
+        self.assertNotIn("١٠٠٪", completed)
+        self.assertNotEqual(completed, next_frame)
+        self.assertNotIn("١٠٠٪", grace_period)
         self.assertIn("جارٍ إكمال البحث", grace_period)
-        self.assertNotIn("ثانية", grace_period)
         self.assertIn("٠٪", bot._wait_progress_for_elapsed("sample", -1))
         self.assertEqual(bot.MAX_LOOKUP_SECONDS, 15)
 

@@ -1087,21 +1087,89 @@ def _arabic_digits(value) -> str:
     return str(value).translate(str.maketrans("0123456789", "٠١٢٣٤٥٦٧٨٩"))
 
 
+def _moving_progress_bar(frame: int, width: int = 16, block: int = 4) -> str:
+    position = int(frame) % (width - block + 1)
+    return "░" * position + "█" * block + "░" * (width - position - block)
+
+
 def _progress_message(username: str, percent: int, headline: str = "") -> str:
     percent = max(0, min(100, int(percent)))
-    filled = percent // 10
-    bar = "🟦" * filled + "⬜" * (10 - filled)
-    title = headline or f"🔎 جارٍ البحث عن @{username}"
-    return f"{title}\n\n{bar} {_arabic_digits(percent)}٪"
+    width = 16
+    filled = (width * percent) // 100
+    bar = "█" * filled + "░" * (width - filled)
+    title = headline or f"🔎 بحث معلومات الحساب · @{username}"
+    return f"{title}\n\n[{bar}] {_arabic_digits(percent)}٪"
 
 
 def _wait_progress_for_elapsed(username: str, elapsed: float) -> str:
     if elapsed < EXPECTED_LOOKUP_SECONDS:
         percent = int(max(0, elapsed) / EXPECTED_LOOKUP_SECONDS * 100)
         return _progress_message(username, percent)
-    frames = ("◴", "◷", "◶", "◵")
-    frame = frames[int(elapsed / PROGRESS_ANIMATION_INTERVAL) % len(frames)]
-    return _progress_message(username, 100, f"{frame} جارٍ إكمال البحث")
+    frame = int(elapsed / PROGRESS_ANIMATION_INTERVAL)
+    bar = _moving_progress_bar(frame)
+    return f"🔎 جارٍ إكمال البحث عن @{username}\n\n[{bar}]\n⏳ نتحقق من البيانات..."
+
+
+def _social_list_progress_text(username, list_kind, requested_count, frame=0, stage="fetch"):
+    title = "قائمة المتابعين" if list_kind == "followers" else "قائمة اللي يتابعهم"
+    bar = _moving_progress_bar(frame)
+    if stage == "render":
+        status = "وصلت البيانات؛ جارٍ تجهيز بطاقة القائمة..."
+    elif requested_count == BRIDGLY_LIST_FREE_VISIBLE_COUNT:
+        status = "جارٍ تحميل أول ٣ حسابات..."
+    else:
+        status = "جارٍ تحميل القائمة الكاملة..."
+    return f"📋 {title}\n👤 @{username}\n\n⏳ {status}\n[{bar}]"
+
+
+async def _send_social_list_progress_message(chat_id, username, list_kind, requested_count):
+    caption = _social_list_progress_text(username, list_kind, requested_count)
+    try:
+        with open(LOADING_GIF_PATH, "rb") as animation:
+            progress_message = await bot.send_animation(
+                chat_id=chat_id, animation=animation, caption=caption
+            )
+        return progress_message, "animation"
+    except Exception as exc:
+        print(f"Social-list animation fallback: {type(exc).__name__}", flush=True)
+        progress_message = await bot.send_message(chat_id=chat_id, text=caption)
+        return progress_message, False
+
+
+async def _await_social_list_operation(
+    chat_id, progress_message, progress_kind, username, list_kind,
+    requested_count, stage, operation,
+):
+    task = asyncio.create_task(operation)
+    frame = 0
+    while not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=PROGRESS_ANIMATION_INTERVAL
+            )
+        except asyncio.TimeoutError:
+            frame += 1
+            try:
+                await _edit_wait_message(
+                    chat_id,
+                    progress_message,
+                    progress_kind,
+                    _social_list_progress_text(
+                        username, list_kind, requested_count, frame, stage
+                    ),
+                )
+            except Exception:
+                pass
+    return task.result()
+
+
+async def _delete_social_list_progress(chat_id, progress_message):
+    if progress_message is None:
+        return
+    try:
+        await bot.delete_message(chat_id, progress_message.message_id)
+    except Exception:
+        pass
 
 
 def _progress_rich_message(text: str, media_source: str) -> types.InputRichMessage:
@@ -2610,9 +2678,21 @@ async def _bridgly_list_button_callback(call, list_kind):
         text="جارٍ جلب القائمة الكاملة…" if full_access else "جارٍ جلب أول ٣ حسابات…",
     )
     destination = _country_delivery_chat_id(call, user_id)
+    progress_message, progress_kind = await _send_social_list_progress_message(
+        destination, lookup["username"], list_kind, requested_count
+    )
     try:
-        users = await _get_site_social_list(
-            lookup["username"], list_kind, requested_count, lookup.get("user_id", "")
+        users = await _await_social_list_operation(
+            destination,
+            progress_message,
+            progress_kind,
+            lookup["username"],
+            list_kind,
+            requested_count,
+            "fetch",
+            _get_site_social_list(
+                lookup["username"], list_kind, requested_count, lookup.get("user_id", "")
+            ),
         )
     except _BridglyRequestError as exc:
         print(f"Website {list_kind} lookup failed: {type(exc).__name__}", flush=True)
@@ -2620,19 +2700,58 @@ async def _bridgly_list_button_callback(call, list_kind):
             "القائمة غير متاحة حاليًا أو ليست ظاهرة للعامة. "
             "تعذر تأكيد توفرها من المصادر المتاحة؛ حاول لاحقًا."
         )
+        await _delete_social_list_progress(destination, progress_message)
         await bot.send_message(chat_id=destination, text=text)
         return
     except Exception as exc:
         print(f"Website {list_kind} lookup failed: {type(exc).__name__}", flush=True)
+        await _delete_social_list_progress(destination, progress_message)
         await bot.send_message(
             chat_id=destination, text="تعذر جلب القائمة حاليًا. حاول مرة أخرى لاحقًا."
         )
         return
 
     try:
-        card_image = await _create_bridgly_list_image(
-            lookup["username"], users, list_kind, locked_count
+        await _edit_wait_message(
+            destination,
+            progress_message,
+            progress_kind,
+            _social_list_progress_text(
+                lookup["username"], list_kind, requested_count, 0, "render"
+            ),
         )
+    except Exception:
+        pass
+
+    try:
+        card_image = await _await_social_list_operation(
+            destination,
+            progress_message,
+            progress_kind,
+            lookup["username"],
+            list_kind,
+            requested_count,
+            "render",
+            _create_bridgly_list_image(
+                lookup["username"], users, list_kind, locked_count
+            ),
+        )
+    except Exception as exc:
+        print(f"Bridgly list image preparation failed: {type(exc).__name__}", flush=True)
+        await _delete_social_list_progress(destination, progress_message)
+        await bot.send_message(
+            chat_id=destination,
+            text=_format_bridgly_list_text(
+                lookup["username"], users, list_kind, locked_count
+            ),
+            reply_markup=(
+                None if full_access else _bridgly_list_unlock_markup(lookup_id)
+            ),
+        )
+        return
+
+    await _delete_social_list_progress(destination, progress_message)
+    try:
         await bot.send_photo(
             chat_id=destination,
             photo=types.InputFile(BytesIO(card_image), file_name="tikwahm-list.jpg"),

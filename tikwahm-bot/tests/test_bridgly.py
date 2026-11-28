@@ -66,6 +66,22 @@ class BridglyListTests(unittest.TestCase):
         bot._SITE_LIST_TASKS = {}
         bot._SITE_LIST_LOCK = asyncio.Lock()
         bot._SOCIAL_SITE_INDEX = 0
+        send_animation_patcher = patch.object(
+            bot.bot, "send_animation", new_callable=AsyncMock,
+            return_value=SimpleNamespace(message_id=987),
+        )
+        self.send_animation = send_animation_patcher.start()
+        self.addCleanup(send_animation_patcher.stop)
+        delete_message_patcher = patch.object(
+            bot.bot, "delete_message", new_callable=AsyncMock
+        )
+        self.delete_message = delete_message_patcher.start()
+        self.addCleanup(delete_message_patcher.stop)
+        edit_caption_patcher = patch.object(
+            bot.bot, "edit_message_caption", new_callable=AsyncMock
+        )
+        self.edit_caption = edit_caption_patcher.start()
+        self.addCleanup(edit_caption_patcher.stop)
 
     def tearDown(self):
         bot.BRIDGLY_API_KEY = self.saved["api_key"]
@@ -412,6 +428,47 @@ class BridglyListTests(unittest.TestCase):
                 self.assertIsInstance(send_photo.await_args.kwargs["photo"], bot.types.InputFile)
                 self.assertIsNone(send_photo.await_args.kwargs["reply_markup"])
                 send_text.assert_not_awaited()
+
+    def test_followers_button_updates_live_loading_while_fetch_runs_once(self):
+        call = self.callback(list_kind="followers", callback_id="followers-progress")
+        users = self.sample_users("progress")
+
+        async def delayed_fetch(*args):
+            await asyncio.sleep(0.01)
+            return users
+
+        with patch.dict(os.environ, {"RENDER_EXTERNAL_URL": ""}), patch.object(
+            bot, "PROGRESS_ANIMATION_INTERVAL", 0.001,
+        ), patch.object(
+            bot, "_get_country_lookup", new_callable=AsyncMock,
+            return_value={"username": "menharef", "user_id": "7090596962206893062"},
+        ), patch.object(
+            bot, "_get_country_access_settings", new_callable=AsyncMock,
+            return_value={"mode": "paid", "stars_price": 17},
+        ), patch.object(
+            bot, "_has_active_country_subscription", new_callable=AsyncMock,
+            return_value=True,
+        ), patch.object(
+            bot, "_get_site_social_list", new_callable=AsyncMock,
+            side_effect=delayed_fetch,
+        ) as fetch, patch.object(
+            bot, "_create_bridgly_list_image", new_callable=AsyncMock,
+            return_value=b"live-list",
+        ), patch.object(
+            bot.bot, "answer_callback_query", new_callable=AsyncMock,
+        ), patch.object(
+            bot.bot, "send_photo", new_callable=AsyncMock,
+        ):
+            self.arun(bot.followers_button_callback(call))
+
+        self.send_animation.assert_awaited_once()
+        self.assertIn("قائمة المتابعين", self.send_animation.await_args.kwargs["caption"])
+        self.assertIn("@menharef", self.send_animation.await_args.kwargs["caption"])
+        self.assertGreaterEqual(self.edit_caption.await_count, 1)
+        fetch.assert_awaited_once_with(
+            "menharef", "followers", 13, "7090596962206893062"
+        )
+        self.delete_message.assert_awaited_once_with(505, 987)
 
     def test_free_view_fetches_only_three_and_routes_unlock_to_shared_country_subscription(self):
         call = self.callback(list_kind="followers", callback_id="followers-locked")
