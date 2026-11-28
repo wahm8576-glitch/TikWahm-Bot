@@ -198,11 +198,13 @@ class TikTokVideoDownloadTests(unittest.TestCase):
         self.assertEqual(rich_message["blocks"][0]["text"], "• Welcome °~ Taylor° to the TikTok Info Bot 🤖")
         self.assertEqual(rich_message["blocks"][4]["buttons"][0]["text"], "Private Section")
 
-    def test_native_widget_is_enabled_only_on_explicit_test_service(self):
+    def test_native_widget_is_enabled_only_on_explicit_tikwahm_services(self):
         base = {"TIKWAHM_NATIVE_WIDGET_ENABLED": "1", "RENDER_EXTERNAL_URL": "https://tikwahm-bot-new.onrender.com"}
         with patch.dict(os.environ, base, clear=False):
             self.assertTrue(bot._native_video_widget_enabled())
         with patch.dict(os.environ, {**base, "RENDER_EXTERNAL_URL": "https://tikwahm-bot.onrender.com"}, clear=False):
+            self.assertTrue(bot._native_video_widget_enabled())
+        with patch.dict(os.environ, {**base, "RENDER_EXTERNAL_URL": "https://other-service.onrender.com"}, clear=False):
             self.assertFalse(bot._native_video_widget_enabled())
         with patch.dict(os.environ, {**base, "TIKWAHM_NATIVE_WIDGET_ENABLED": "0"}, clear=False):
             self.assertFalse(bot._native_video_widget_enabled())

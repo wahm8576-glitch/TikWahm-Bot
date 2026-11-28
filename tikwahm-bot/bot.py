@@ -1844,17 +1844,23 @@ async def _answer_native_video_widget_query(query_id, session, status, message="
         return None
 
 
+_NATIVE_VIDEO_WIDGET_SERVICE_URLS = frozenset({
+    "https://tikwahm-bot-new.onrender.com",
+    "https://tikwahm-bot.onrender.com",
+})
+
+
 def _native_video_widget_enabled():
     service_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     return (
         os.environ.get("TIKWAHM_NATIVE_WIDGET_ENABLED") == "1"
-        and service_url == "https://tikwahm-bot-new.onrender.com"
+        and service_url in _NATIVE_VIDEO_WIDGET_SERVICE_URLS
     )
 
 
 async def _send_native_video_widget(chat_id, user_id, reply_to_message_id, language):
     if not _native_video_widget_enabled():
-        raise RuntimeError("Native video widget is restricted to the test service")
+        raise RuntimeError("Native video widget is restricted to approved TikWahm services")
     widget_html = Path(__file__).with_name("video_widget.html").read_text(encoding="utf-8")
     widget_bytes = widget_html.encode("utf-8")
     if len(widget_bytes) > 32768 or len(zlib.compress(widget_bytes, 9)) > 4096:
