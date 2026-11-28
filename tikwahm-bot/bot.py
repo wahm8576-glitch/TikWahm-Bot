@@ -77,6 +77,10 @@ MAX_LOOKUP_SECONDS = 15
 EXPECTED_LOOKUP_SECONDS = 10
 CACHE_TTL_SECONDS = 10 * 60
 USER_SEARCH_COOLDOWN_SECONDS = 20
+INLINE_QUERY_DEBOUNCE_SECONDS = 0.35
+INLINE_QUERY_WAIT_SECONDS = 6.5
+INLINE_QUERY_COOLDOWN_SECONDS = 3
+INLINE_QUERY_CACHE_SECONDS = 30
 # Query FinTok's JSON endpoints directly; a short per-proxy timeout keeps lookups responsive.
 SOURCE_TIMEOUT_SECONDS = 8
 MAX_SOURCE_RESPONSE_BYTES = 1_000_000
@@ -100,6 +104,9 @@ TIKTOK_MEDIA_HOST_SUFFIXES = (
 )
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
+_INLINE_QUERY_LATEST = OrderedDict()
+_INLINE_QUERY_LAST_SEARCH_AT = OrderedDict()
+_INLINE_QUERY_LOCK = asyncio.Lock()
 _RETRY_IN_PROGRESS = set()
 _TIKTOK_DOWNLOAD_PENDING = {}
 _TIKTOK_DOWNLOAD_ACTIVE = set()
@@ -655,6 +662,25 @@ def _fintok_language(value):
     return f"{arabic_name} ({value})" if arabic_name else value
 
 
+def _inline_public_profile(username, profile):
+    """Build an allowlisted public profile, never region, security or paid data."""
+    profile = profile if isinstance(profile, dict) else {}
+    handle = normalize_username(str(profile.get("username") or username)) or username
+    name = " ".join(str(profile.get("fullname") or "").split())[:128]
+    lines = ["معلومات حساب TikTok العامة"]
+    if name:
+        lines.append(f"الاسم: {name}")
+    lines.extend([f"اسم المستخدم: @{handle}", "البيان | القيمة"])
+    for label, key in (("يتابع", "following"), ("المتابعون", "followers"), ("الإعجابات", "likes")):
+        value = _fintok_display_value(profile.get(key), compact_number=True)
+        if value is not None and value != "":
+            lines.append(f"{label} | {' '.join(str(value).split())[:80]}")
+    account_type = _fintok_account_type(profile.get("private"))
+    if account_type is not None and account_type != "":
+        lines.append(f"نوع الحساب | {' '.join(str(account_type).split())[:80]}")
+    return "\n".join(lines)
+
+
 def format_fintok_result(username, profile, active_region, registered_region, security):
     """Preserve the labels, values and order displayed by FinTok's profile page."""
     profile = profile if isinstance(profile, dict) else {}
@@ -1017,6 +1043,7 @@ async def _fetch_once_through_proxy(username: str, proxy, progress=None):
     _set_progress(progress, "وصلت البيانات؛ جارٍ تنسيق النتيجة")
     result = format_fintok_result(username, profile, active_region, registered_region, security)
     result["user_id"] = str(uid)
+    result["inline_public"] = _inline_public_profile(username, profile)
     return result
 
 
@@ -2250,6 +2277,147 @@ async def send_welcome(message):
     )
 
 
+def _inline_query_language(query):
+    user = getattr(query, "from_user", None)
+    language_code = str(getattr(user, "language_code", "") or "").lower().split("-", 1)[0]
+    return "en" if language_code == "en" else "ar"
+
+
+def _inline_article(query, username, title, message_text):
+    message_text = str(message_text or "").strip()[:4096]
+    description = " ".join(part.strip() for part in message_text.splitlines() if part.strip())[:255]
+    result_id = hashlib.sha256(
+        f"{username.casefold()}:{message_text}".encode("utf-8")
+    ).hexdigest()[:32]
+    return types.InlineQueryResultArticle(
+        id=result_id,
+        title=str(title)[:64],
+        description=description,
+        input_message_content=types.InputTextMessageContent(message_text=message_text),
+    )
+
+
+async def _reserve_inline_query_search(user_id, now=None):
+    if user_id is None:
+        return 0
+    now = time.monotonic() if now is None else now
+    key = str(user_id)
+    async with _INLINE_QUERY_LOCK:
+        last_started = _INLINE_QUERY_LAST_SEARCH_AT.get(key)
+        if last_started is not None:
+            remaining = INLINE_QUERY_COOLDOWN_SECONDS - (now - last_started)
+            if remaining > 0:
+                _INLINE_QUERY_LAST_SEARCH_AT.move_to_end(key)
+                return max(1, math.ceil(remaining))
+        _INLINE_QUERY_LAST_SEARCH_AT[key] = now
+        _INLINE_QUERY_LAST_SEARCH_AT.move_to_end(key)
+        if len(_INLINE_QUERY_LAST_SEARCH_AT) > 10_000:
+            _INLINE_QUERY_LAST_SEARCH_AT.popitem(last=False)
+    return 0
+
+
+@bot.inline_handler(func=lambda _query: True)
+async def inline_query_handler(query):
+    language = _inline_query_language(query)
+    copy = {
+        "ar": {
+            "help_title": "ابحث عن حساب TikTok عام",
+            "help_text": "اكتب اسم مستخدم TikTok بعد اسم البوت، مثل: username",
+            "invalid_title": "اسم المستخدم غير صالح",
+            "invalid_text": "أرسل اسم مستخدم TikTok صالحًا أو رابط ملفه العام.",
+            "wait_title": "البحث يستغرق وقتًا أطول",
+            "wait_text": "تعذر تجهيز البيانات بسرعة. أعد المحاولة بعد لحظات أو ابحث في محادثة البوت.",
+            "cooldown_title": "انتظر قليلًا قبل البحث التالي",
+            "cooldown_text": "يمكنك بدء بحث Inline جديد بعد {seconds} ثوانٍ.",
+            "result_title": "معلومات TikTok العامة: @{username}",
+        },
+        "en": {
+            "help_title": "Search public TikTok profiles",
+            "help_text": "Type a TikTok username after the bot, for example: username",
+            "invalid_title": "Invalid username",
+            "invalid_text": "Enter a valid TikTok username or public profile URL.",
+            "wait_title": "The search is taking longer",
+            "wait_text": "The profile could not be prepared quickly. Try again shortly or search in the bot chat.",
+            "cooldown_title": "Please wait before another search",
+            "cooldown_text": "You can start another inline search in {seconds} seconds.",
+            "result_title": "Public TikTok information: @{username}",
+        },
+    }[language]
+    raw_query = str(getattr(query, "query", "") or "").strip()
+    if not raw_query:
+        result = _inline_article(query, "help", copy["help_title"], copy["help_text"])
+        await bot.answer_inline_query(
+            query.id, [result], cache_time=INLINE_QUERY_CACHE_SECONDS, is_personal=False
+        )
+        return
+
+    username = normalize_username(raw_query)
+    if not username:
+        result = _inline_article(query, "invalid", copy["invalid_title"], copy["invalid_text"])
+        await bot.answer_inline_query(
+            query.id, [result], cache_time=INLINE_QUERY_CACHE_SECONDS, is_personal=False
+        )
+        return
+
+    user = getattr(query, "from_user", None)
+    user_id = getattr(user, "id", None)
+    if user_id is not None:
+        _INLINE_QUERY_LATEST[user_id] = query.id
+        _INLINE_QUERY_LATEST.move_to_end(user_id)
+        if len(_INLINE_QUERY_LATEST) > 2_048:
+            _INLINE_QUERY_LATEST.popitem(last=False)
+        await asyncio.sleep(INLINE_QUERY_DEBOUNCE_SECONDS)
+        if _INLINE_QUERY_LATEST.get(user_id) != query.id:
+            return
+
+    remaining = await _reserve_inline_query_search(user_id)
+    if remaining:
+        result = _inline_article(
+            query,
+            username,
+            copy["cooldown_title"],
+            copy["cooldown_text"].format(seconds=remaining),
+        )
+        await bot.answer_inline_query(
+            query.id, [result], cache_time=0, is_personal=True
+        )
+        return
+
+    cached_result, task, is_cached = _get_or_start_lookup(username)
+    if is_cached:
+        lookup_result = cached_result
+    else:
+        try:
+            lookup_result = await asyncio.wait_for(
+                asyncio.shield(task), timeout=INLINE_QUERY_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            lookup_result = None
+
+    if user_id is not None and _INLINE_QUERY_LATEST.get(user_id) != query.id:
+        return
+    if lookup_result is None:
+        result_text = copy["wait_text"]
+        title = copy["wait_title"]
+    elif isinstance(lookup_result, dict):
+        # This is an allowlist built directly from public profile fields, not the
+        # normal result text (which can include location and security information).
+        result_text = str(lookup_result.get("inline_public") or copy["wait_text"])
+        title = copy["result_title"].format(username=username)
+    else:
+        result_text = str(lookup_result)
+        title = copy["result_title"].format(username=username)
+
+    result = _inline_article(query, username, title, result_text)
+    await bot.answer_inline_query(
+        query.id, [result],
+        cache_time=INLINE_QUERY_CACHE_SECONDS if isinstance(lookup_result, dict) and lookup_result.get("inline_public") else 0,
+        is_personal=False,
+    )
+    if user_id is not None and _INLINE_QUERY_LATEST.get(user_id) == query.id:
+        _INLINE_QUERY_LATEST.pop(user_id, None)
+
+
 _USER_LANGUAGE_OVERRIDES = {}
 
 _WELCOME_COPY = {
@@ -3135,7 +3303,7 @@ async def lifespan(_app: FastAPI):
     webhook_set = await bot.set_webhook(
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
-        allowed_updates=["message", "callback_query", "pre_checkout_query"],
+        allowed_updates=["message", "callback_query", "pre_checkout_query", "inline_query"],
     )
     if not webhook_set:
         raise RuntimeError("Telegram did not accept the webhook configuration")
