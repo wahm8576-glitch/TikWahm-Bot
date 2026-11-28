@@ -251,6 +251,62 @@ class TikTokVideoDownloadTests(unittest.TestCase):
         self.assertIsInstance(send_message.await_args.kwargs["reply_markup"], bot.types.ForceReply)
         self.assertIn("رابط فيديو TikTok", send_message.await_args.kwargs["text"])
 
+    def test_enabled_video_button_sends_native_widget_instead_of_force_reply(self):
+        call = SimpleNamespace(
+            id="callback-widget",
+            data="download:video",
+            from_user=SimpleNamespace(id=505, language_code="ar"),
+            message=SimpleNamespace(
+                message_id=202,
+                chat=SimpleNamespace(id=505, type="private"),
+            ),
+        )
+        with patch.dict(os.environ, {
+            "TIKWAHM_NATIVE_WIDGET_ENABLED": "1",
+            "RENDER_EXTERNAL_URL": "https://tikwahm-bot.onrender.com",
+        }, clear=False), patch.object(
+            bot.bot, "answer_callback_query", new_callable=AsyncMock
+        ), patch.object(
+            bot, "_send_native_video_widget", new_callable=AsyncMock
+        ) as send_widget, patch.object(
+            bot.bot, "send_message", new_callable=AsyncMock
+        ) as send_message:
+            self.arun(bot.request_tiktok_video_link(call))
+
+        send_widget.assert_awaited_once_with(505, 505, 202, "ar")
+        send_message.assert_not_awaited()
+
+    def test_widget_api_rejection_is_logged_with_detail_and_keeps_download_fallback(self):
+        call = SimpleNamespace(
+            id="callback-widget-failed",
+            data="download:video",
+            from_user=SimpleNamespace(id=505, language_code="ar"),
+            message=SimpleNamespace(
+                message_id=202,
+                chat=SimpleNamespace(id=505, type="private"),
+            ),
+        )
+        error = Exception("generic exception text is not used")
+        error.error_code = 400
+        error.description = "Bad Request: test rejection"
+        prompt = SimpleNamespace(message_id=303)
+        with patch.dict(os.environ, {
+            "TIKWAHM_NATIVE_WIDGET_ENABLED": "1",
+            "RENDER_EXTERNAL_URL": "https://tikwahm-bot.onrender.com",
+        }, clear=False), patch.object(
+            bot.bot, "answer_callback_query", new_callable=AsyncMock
+        ), patch.object(
+            bot, "_send_native_video_widget", new_callable=AsyncMock, side_effect=error
+        ), patch.object(
+            bot.bot, "send_message", new_callable=AsyncMock, return_value=prompt
+        ) as send_message, patch("builtins.print") as log:
+            self.arun(bot.request_tiktok_video_link(call))
+
+        self.assertIsInstance(send_message.await_args.kwargs["reply_markup"], bot.types.ForceReply)
+        logged_text = " ".join(str(call.args[0]) for call in log.call_args_list if call.args)
+        self.assertIn("code=400", logged_text)
+        self.assertIn("Bad Request: test rejection", logged_text)
+
     def test_pending_video_link_routes_to_downloader_not_account_search(self):
         message = self.message("https://vm.tiktok.com/ZN8HD2jGK/")
         key = (505, 505)

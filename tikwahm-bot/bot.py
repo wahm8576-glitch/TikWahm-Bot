@@ -2381,7 +2381,14 @@ async def request_tiktok_video_link(call):
             )
             return
         except Exception as exc:
-            print(f"Native video widget send failed ({type(exc).__name__}); using ForceReply.", flush=True)
+            error_code = getattr(exc, "error_code", "unknown")
+            error_description = getattr(exc, "description", "")
+            error_description = " ".join(str(error_description).split())[:256] or "no API description"
+            print(
+                f"Native video widget send failed ({type(exc).__name__}, code={error_code}, "
+                f"description={error_description}); using ForceReply.",
+                flush=True,
+            )
     prompt_text = (
         "Send a public TikTok video link to download. Example:\nhttps://vm.tiktok.com/…"
         if language == "en"
