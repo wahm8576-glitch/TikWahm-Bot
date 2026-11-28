@@ -121,6 +121,29 @@ class InlineModeTests(unittest.TestCase):
         positions = [text.index(label) for label in ordered_labels]
         self.assertEqual(positions, sorted(positions))
 
+    def test_inline_preserves_complete_source_values_and_spacing(self):
+        name = "  Name  " + "x" * 140
+        user_id = "id  " + "9" * 100
+        last_change = "day  time  "
+        text = bot._inline_public_profile("sample", {
+            "fullname": name, "userid": user_id, "last_change_name": last_change,
+        })
+        self.assertIn(f"الاسم: {name}\n", text)
+        self.assertIn(f"معرّف المستخدم | {user_id}\n", text)
+        self.assertTrue(text.endswith(f"آخر تغيير للاسم | {last_change}"))
+        article = bot._inline_article(self.query(), "sample", "title", text)
+        self.assertEqual(article.input_message_content.message_text, text)
+
+    def test_oversized_profile_gets_explicit_message_not_truncated_data(self):
+        long_text = "معلومات عامة " + "😀" * 2100
+        bot._LOOKUP_CACHE["sample"] = (time.monotonic() + 60, {"inline_public": long_text})
+        with patch.object(bot.bot, "answer_inline_query", new_callable=AsyncMock) as answer:
+            self.arun(bot.inline_query_handler(self.query()))
+        result = self.answer_result(answer)
+        self.assertIn("أطول من حد", result.input_message_content.message_text)
+        self.assertNotIn("😀", result.input_message_content.message_text)
+        self.assertEqual(answer.await_args.kwargs["cache_time"], 0)
+
     def test_invalid_query_does_not_start_a_lookup(self):
         query = self.query(text="sample name")
         with patch.object(bot.bot, "answer_inline_query", new_callable=AsyncMock) as answer, \

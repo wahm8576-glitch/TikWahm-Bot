@@ -666,7 +666,7 @@ def _inline_public_profile(username, profile):
     """Build an allowlisted public profile, never region, security or paid data."""
     profile = profile if isinstance(profile, dict) else {}
     handle = normalize_username(str(profile.get("username") or username)) or username
-    name = " ".join(str(profile.get("fullname") or "").split())[:128]
+    name = str(profile.get("fullname") or "")
     lines = ["معلومات حساب TikTok العامة"]
     if name:
         lines.append(f"الاسم: {name}")
@@ -683,7 +683,7 @@ def _inline_public_profile(username, profile):
     ]
     for label, value in rows:
         if value is not None and value != "":
-            lines.append(f"{label} | {' '.join(str(value).split())[:80]}")
+            lines.append(f"{label} | {value}")
     return "\n".join(lines)
 
 
@@ -2290,7 +2290,7 @@ def _inline_query_language(query):
 
 
 def _inline_article(query, username, title, message_text):
-    message_text = str(message_text or "").strip()[:4096]
+    message_text = str(message_text or "")[:4096]
     description = " ".join(part.strip() for part in message_text.splitlines() if part.strip())[:255]
     result_id = hashlib.sha256(
         f"{username.casefold()}:{message_text}".encode("utf-8")
@@ -2336,6 +2336,8 @@ async def inline_query_handler(query):
             "cooldown_title": "انتظر قليلًا قبل البحث التالي",
             "cooldown_text": "يمكنك بدء بحث Inline جديد بعد {seconds} ثوانٍ.",
             "result_title": "معلومات TikTok العامة: @{username}",
+            "long_title": "البيانات أطول من حد Telegram",
+            "long_text": "البيانات أطول من حد رسالة Telegram. ابحث عن الحساب في محادثة البوت لعرضها.",
         },
         "en": {
             "help_title": "Search public TikTok profiles",
@@ -2347,6 +2349,8 @@ async def inline_query_handler(query):
             "cooldown_title": "Please wait before another search",
             "cooldown_text": "You can start another inline search in {seconds} seconds.",
             "result_title": "Public TikTok information: @{username}",
+            "long_title": "Profile exceeds Telegram's message limit",
+            "long_text": "This profile exceeds Telegram's message limit. Search for the account in the bot chat to view it.",
         },
     }[language]
     raw_query = str(getattr(query, "query", "") or "").strip()
@@ -2414,10 +2418,15 @@ async def inline_query_handler(query):
         result_text = str(lookup_result)
         title = copy["result_title"].format(username=username)
 
+    # Telegram's message limit is 4096; counting UTF-16 units conservatively
+    # also handles emoji without silently truncating a public source value.
+    too_long = len(result_text.encode("utf-16-le")) // 2 > 4096
+    if too_long:
+        title, result_text = copy["long_title"], copy["long_text"]
     result = _inline_article(query, username, title, result_text)
     await bot.answer_inline_query(
         query.id, [result],
-        cache_time=INLINE_QUERY_CACHE_SECONDS if isinstance(lookup_result, dict) and lookup_result.get("inline_public") else 0,
+        cache_time=INLINE_QUERY_CACHE_SECONDS if not too_long and isinstance(lookup_result, dict) and lookup_result.get("inline_public") else 0,
         is_personal=False,
     )
     if user_id is not None and _INLINE_QUERY_LATEST.get(user_id) == query.id:
