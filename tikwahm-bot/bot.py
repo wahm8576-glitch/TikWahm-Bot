@@ -20,6 +20,7 @@ import time
 from urllib.parse import quote, urlencode, urlparse, urlsplit
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import zlib
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse, Response
@@ -89,6 +90,7 @@ TIKTOK_MEDIA_TIMEOUT_SECONDS = 45
 MAX_TIKTOK_VIDEO_BYTES = 47 * 1024 * 1024
 TIKTOK_DOWNLOAD_PENDING_TTL_SECONDS = 10 * 60
 TIKTOK_PROGRESS_INTERVAL_SECONDS = 1.0
+VIDEO_WIDGET_SESSION_TTL_SECONDS = 10 * 60
 TIKTOK_SHORT_LINK_HOSTS = frozenset({
     "vm.tiktok.com", "www.vm.tiktok.com", "vt.tiktok.com", "www.vt.tiktok.com",
 })
@@ -103,6 +105,8 @@ _RETRY_IN_PROGRESS = set()
 _TIKTOK_DOWNLOAD_PENDING = {}
 _TIKTOK_DOWNLOAD_ACTIVE = set()
 _TIKTOK_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
+_VIDEO_WIDGET_SESSIONS = OrderedDict()
+_VIDEO_WIDGET_DOWNLOAD_ACTIVE = set()
 _BRIDGLY_LIST_CACHE = OrderedDict()
 _BRIDGLY_LIST_TASKS = {}
 _BRIDGLY_LIST_LOCK = asyncio.Lock()
@@ -1777,12 +1781,250 @@ async def _await_tiktok_thread(chat_id, progress_message, phase, function, *args
     return await task
 
 
-async def _process_tiktok_video_message(message, url):
+def _native_video_widget_state(session, status, message="", retry=False):
+    state = {"status": status, "lang": session.get("lang", "ar")}
+    if message:
+        state["message"] = str(message)[:300]
+    if retry:
+        state["retry"] = True
+    return state
+
+
+def _native_video_widget_session(key):
+    session = _VIDEO_WIDGET_SESSIONS.get(key)
+    if not session:
+        return None
+    if session.get("expires_at", 0) <= time.monotonic():
+        _VIDEO_WIDGET_SESSIONS.pop(key, None)
+        _TIKTOK_DOWNLOAD_PENDING.pop(key, None)
+        return None
+    _VIDEO_WIDGET_SESSIONS.move_to_end(key)
+    return session
+
+
+async def _edit_native_video_widget(chat_id, message_id, session, status, message="", retry=False):
+    params = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "chat_data": json.dumps(
+            _native_video_widget_state(session, status, message, retry),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
+    }
+    try:
+        return await asyncio.to_thread(
+            apihelper._make_request,
+            BOT_TOKEN,
+            "editMessageWidgetData",
+            method="post",
+            params=params,
+        )
+    except Exception as exc:
+        print(f"Telegram widget state update failed ({type(exc).__name__}).", flush=True)
+        return None
+
+
+async def _answer_native_video_widget_query(query_id, session, status, message="", retry=False):
+    result = json.dumps(
+        _native_video_widget_state(session, status, message, retry),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        return await asyncio.to_thread(
+            apihelper._make_request,
+            BOT_TOKEN,
+            "answerWidgetQuery",
+            method="post",
+            params={"widget_query_id": query_id, "data": result},
+        )
+    except Exception as exc:
+        print(f"Telegram widget query answer failed ({type(exc).__name__}).", flush=True)
+        return None
+
+
+def _native_video_widget_enabled():
+    service_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    return (
+        os.environ.get("TIKWAHM_NATIVE_WIDGET_ENABLED") == "1"
+        and service_url == "https://tikwahm-bot-new.onrender.com"
+    )
+
+
+async def _send_native_video_widget(chat_id, user_id, reply_to_message_id, language):
+    if not _native_video_widget_enabled():
+        raise RuntimeError("Native video widget is restricted to the test service")
+    widget_html = Path(__file__).with_name("video_widget.html").read_text(encoding="utf-8")
+    widget_bytes = widget_html.encode("utf-8")
+    if len(widget_bytes) > 32768 or len(zlib.compress(widget_bytes, 9)) > 4096:
+        raise RuntimeError("Telegram widget HTML exceeds the documented size limit")
+    initial_state = {"status": "waiting_link", "lang": language or "ar"}
+    params = {
+        "chat_id": chat_id,
+        "html": widget_html,
+        "width": 360,
+        "height": 205,
+        "caption": (
+            "أرسل رابط فيديو TikTok كرسالة في هذه المحادثة، ثم اضغط زر التنزيل داخل الـWidget."
+            if language != "en"
+            else "Send a TikTok video link in this chat, then tap Download in the widget."
+        ),
+        "allow_queries": True,
+        "chat_data": json.dumps(initial_state, ensure_ascii=False, separators=(",", ":")),
+    }
+    if reply_to_message_id is not None:
+        params["reply_parameters"] = json.dumps({"message_id": reply_to_message_id})
+    result = await asyncio.to_thread(
+        apihelper._make_request,
+        BOT_TOKEN,
+        "sendWidget",
+        method="post",
+        params=params,
+    )
+    message_id = result.get("message_id") if isinstance(result, dict) else None
+    if not message_id:
+        raise RuntimeError("Telegram did not return the sent widget message")
+    key = (chat_id, user_id)
+    session = {
+        "message_id": message_id,
+        "url": None,
+        "link_message_id": None,
+        "lang": language or "ar",
+        "status": "waiting_link",
+        "expires_at": time.monotonic() + VIDEO_WIDGET_SESSION_TTL_SECONDS,
+    }
+    _VIDEO_WIDGET_SESSIONS[key] = session
+    _VIDEO_WIDGET_SESSIONS.move_to_end(key)
+    while len(_VIDEO_WIDGET_SESSIONS) > 1000:
+        _VIDEO_WIDGET_SESSIONS.popitem(last=False)
+    _TIKTOK_DOWNLOAD_PENDING[key] = time.monotonic() + TIKTOK_DOWNLOAD_PENDING_TTL_SECONDS
+    return session
+
+
+async def _capture_native_widget_video_link(message, key, video_url):
+    session = _native_video_widget_session(key)
+    if not session:
+        return False
+    session["url"] = video_url
+    session["link_message_id"] = getattr(message, "message_id", None)
+    session["link_message"] = message
+    session["status"] = "ready"
+    session["expires_at"] = time.monotonic() + VIDEO_WIDGET_SESSION_TTL_SECONDS
+    _TIKTOK_DOWNLOAD_PENDING.pop(key, None)
+    await _edit_native_video_widget(
+        message.chat.id, session["message_id"], session, "ready"
+    )
+    await bot.reply_to(
+        message,
+        "وصل الرابط. اضغط «تنزيل MP4 الآن» داخل الـWidget لإكمال الطلب."
+        if session["lang"] != "en"
+        else "Link received. Tap “Download MP4” in the widget to continue.",
+    )
+    return True
+
+
+async def _run_native_video_widget_download(key, session):
+    try:
+        message = session.get("link_message")
+        video_url = session.get("url")
+        if message is None or not video_url:
+            session["status"] = "error"
+            await _edit_native_video_widget(
+                key[0], session["message_id"], session, "error",
+                "تعذر العثور على الرابط. أرسله مجددًا في المحادثة.", retry=False,
+            )
+            return
+        success = await _process_tiktok_video_message(
+            message, video_url, widget_session=session
+        )
+        session["status"] = "complete" if success else "error"
+        session["expires_at"] = time.monotonic() + VIDEO_WIDGET_SESSION_TTL_SECONDS
+        await _edit_native_video_widget(
+            key[0], session["message_id"], session,
+            "complete" if success else "error",
+            "" if success else "تعذر التنزيل أو إرسال الملف. اضغط لإعادة المحاولة.",
+            retry=not success,
+        )
+    except Exception as exc:
+        session["status"] = "error"
+        print(f"Native video widget download failed ({type(exc).__name__}).", flush=True)
+        await _edit_native_video_widget(
+            key[0], session["message_id"], session, "error",
+            "تعذر التنزيل الآن. اضغط لإعادة المحاولة.", retry=True,
+        )
+    finally:
+        _VIDEO_WIDGET_DOWNLOAD_ACTIVE.discard(key)
+
+
+async def _process_native_video_widget_query(query):
+    query_id = str(query.get("id", ""))
+    sender = query.get("from") or {}
+    chat = query.get("chat") or {}
+    try:
+        user_id = int(sender.get("id"))
+        chat_id = int(chat.get("id"))
+        message_id = int(query.get("message_id"))
+    except (TypeError, ValueError):
+        if query_id:
+            await _answer_native_video_widget_query(
+                query_id, {"lang": "ar"}, "error", "تعذر التحقق من طلب الـWidget."
+            )
+        return
+    if not query_id:
+        return
+    key = (chat_id, user_id)
+    session = _native_video_widget_session(key)
+    if (
+        chat.get("type") != "private"
+        or chat_id != user_id
+        or not session
+        or session.get("message_id") != message_id
+    ):
+        await _answer_native_video_widget_query(
+            query_id, session or {"lang": "ar"}, "error",
+            "انتهت صلاحية هذه الجلسة. افتح قسم التحميل وابدأ من جديد.",
+        )
+        return
+    action = str(query.get("data", ""))
+    if action != "download":
+        await _answer_native_video_widget_query(
+            query_id, session, "error", "طلب غير معروف. اضغط زر التنزيل داخل الـWidget."
+        )
+        return
+    if not _native_video_widget_enabled():
+        await _answer_native_video_widget_query(
+            query_id, session, "error", "عرض الـWidget متاح على بيئة الاختبار فقط."
+        )
+        return
+    if not session.get("url") or session.get("link_message") is None:
+        await _answer_native_video_widget_query(
+            query_id, session, "waiting_link", "أرسل رابط TikTok كرسالة في المحادثة أولًا."
+        )
+        return
+    if key in _VIDEO_WIDGET_DOWNLOAD_ACTIVE:
+        await _answer_native_video_widget_query(query_id, session, "downloading")
+        return
+    if session.get("status") == "complete":
+        await _answer_native_video_widget_query(query_id, session, "complete")
+        return
+
+    _VIDEO_WIDGET_DOWNLOAD_ACTIVE.add(key)
+    session["status"] = "queued"
+    session["expires_at"] = time.monotonic() + VIDEO_WIDGET_SESSION_TTL_SECONDS
+    await _answer_native_video_widget_query(query_id, session, "queued")
+    await _edit_native_video_widget(
+        chat_id, message_id, session, "queued", "جارٍ تجهيز طلب التنزيل…"
+    )
+    asyncio.create_task(_run_native_video_widget_download(key, session))
+
+
+async def _process_tiktok_video_message(message, url, widget_session=None):
     chat_id = message.chat.id
     key = _tiktok_download_key(message)
     if key is not None and key in _TIKTOK_DOWNLOAD_ACTIVE:
         await bot.reply_to(message, "يوجد تنزيل فيديو جارٍ بالفعل؛ انتظر حتى يكتمل.")
-        return
+        return False
     if key is not None:
         _TIKTOK_DOWNLOAD_ACTIVE.add(key)
     progress_message = None
@@ -1793,6 +2035,12 @@ async def _process_tiktok_video_message(message, url):
             reply_to_message_id=getattr(message, "message_id", None),
         )
         async with _TIKTOK_DOWNLOAD_SEMAPHORE:
+            if widget_session:
+                widget_session["status"] = "extracting"
+                await _edit_native_video_widget(
+                    chat_id, widget_session["message_id"], widget_session, "extracting",
+                    "جارٍ استخراج الفيديو من TikTok…",
+                )
             media_url, title = await _await_tiktok_thread(
                 chat_id,
                 progress_message,
@@ -1800,6 +2048,12 @@ async def _process_tiktok_video_message(message, url):
                 _request_tiktok_video_details,
                 url,
             )
+            if widget_session:
+                widget_session["status"] = "downloading"
+                await _edit_native_video_widget(
+                    chat_id, widget_session["message_id"], widget_session, "downloading",
+                    "تم العثور على الفيديو؛ جارٍ تنزيل MP4…",
+                )
             await _edit_tiktok_progress(
                 chat_id,
                 progress_message,
@@ -1823,11 +2077,13 @@ async def _process_tiktok_video_message(message, url):
         await _edit_tiktok_progress(
             chat_id, progress_message, "✅ اكتمل التنزيل وأُرسل الفيديو."
         )
+        return True
     except _TikTokVideoDownloadError as exc:
         if progress_message:
             await _edit_tiktok_progress(chat_id, progress_message, f"❌ {exc}")
         else:
             await bot.reply_to(message, f"❌ {exc}")
+        return False
     except Exception as exc:
         print(f"TikTok video delivery failed ({type(exc).__name__}).", flush=True)
         if progress_message:
@@ -1841,6 +2097,7 @@ async def _process_tiktok_video_message(message, url):
                 message,
                 "❌ تعذر إرسال الفيديو الآن. تأكد أن الرابط عام ثم أعد المحاولة.",
             )
+        return False
     finally:
         if key is not None:
             _TIKTOK_DOWNLOAD_ACTIVE.discard(key)
@@ -2106,6 +2363,19 @@ async def request_tiktok_video_link(call):
         return
     chat_id = message.chat.id
     language = _user_language(getattr(call, "from_user", None))
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    if (
+        user_id is not None
+        and getattr(getattr(message, "chat", None), "type", None) == "private"
+        and _native_video_widget_enabled()
+    ):
+        try:
+            await _send_native_video_widget(
+                chat_id, user_id, getattr(message, "message_id", None), language
+            )
+            return
+        except Exception as exc:
+            print(f"Native video widget send failed ({type(exc).__name__}); using ForceReply.", flush=True)
     prompt_text = (
         "Send a public TikTok video link to download. Example:\nhttps://vm.tiktok.com/…"
         if language == "en"
@@ -2120,7 +2390,6 @@ async def request_tiktok_video_link(call):
         ),
         reply_to_message_id=message.message_id,
     )
-    user_id = getattr(getattr(call, "from_user", None), "id", None)
     key = (chat_id, user_id) if user_id is not None else None
     if key is not None:
         _TIKTOK_DOWNLOAD_PENDING[key] = time.monotonic() + TIKTOK_DOWNLOAD_PENDING_TTL_SECONDS
@@ -2583,6 +2852,8 @@ async def handle_username_message(message):
     video_url = _extract_tiktok_video_url(raw_text)
     if video_url:
         if pending_video_key is not None:
+            if await _capture_native_widget_video_link(message, pending_video_key, video_url):
+                return
             _TIKTOK_DOWNLOAD_PENDING.pop(pending_video_key, None)
             await _process_tiktok_video_message(message, video_url)
         else:
@@ -2690,7 +2961,7 @@ async def lifespan(_app: FastAPI):
     webhook_set = await bot.set_webhook(
         url=webhook_url,
         secret_token=WEBHOOK_SECRET,
-        allowed_updates=["message", "callback_query", "pre_checkout_query"],
+        allowed_updates=["message", "callback_query", "pre_checkout_query", "widget_query"],
     )
     if not webhook_set:
         raise RuntimeError("Telegram did not accept the webhook configuration")
@@ -4260,6 +4531,9 @@ def _claim_webhook_update(update_id):
 
 async def _process_webhook_update(update):
     try:
+        if isinstance(update, dict) and isinstance(update.get("widget_query"), dict):
+            await _process_native_video_widget_query(update["widget_query"])
+            return
         await bot.process_new_updates([update])
     except Exception as exc:
         print(f"Telegram update processing failed ({type(exc).__name__}).", flush=True)
@@ -4272,8 +4546,14 @@ async def telegram_webhook(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     try:
-        update = types.Update.de_json(json.dumps(await request.json()))
-        update_id = getattr(update, "update_id", None)
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Webhook payload must be a JSON object")
+        update_id = payload.get("update_id")
+        if isinstance(payload.get("widget_query"), dict):
+            update = payload
+        else:
+            update = types.Update.de_json(json.dumps(payload))
     except Exception as exc:
         print(f"Telegram update parsing failed ({type(exc).__name__}).", flush=True)
         raise HTTPException(status_code=400, detail="Invalid update") from exc
