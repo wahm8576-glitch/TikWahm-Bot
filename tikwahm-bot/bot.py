@@ -17,7 +17,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 import time
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse, urlsplit
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
@@ -34,7 +34,7 @@ except ImportError:  # Firebase is optional for local/mock runs.
     firebase_admin = None
     firebase_credentials = firestore = AlreadyExists = None
 
-from telebot import asyncio_helper, types
+from telebot import apihelper, asyncio_helper, types
 from telebot.async_telebot import AsyncTeleBot
 import pycountry
 
@@ -83,9 +83,26 @@ PROGRESS_ANIMATION_INTERVAL = 1.0
 LOADING_GIF_PATH = os.path.join(os.path.dirname(__file__), "tikwahm_loading.gif")
 PROGRESS_MEDIA_ID = "tikwahm_loading"
 PROGRESS_ATTACHMENT_NAME = "loading_animation"
+TIKTOK_DOWNLOAD_ENDPOINT = f"{FINTOK_API_URL}/download"
+TIKTOK_API_TIMEOUT_SECONDS = 30
+TIKTOK_MEDIA_TIMEOUT_SECONDS = 45
+MAX_TIKTOK_VIDEO_BYTES = 47 * 1024 * 1024
+TIKTOK_DOWNLOAD_PENDING_TTL_SECONDS = 10 * 60
+TIKTOK_PROGRESS_INTERVAL_SECONDS = 1.0
+TIKTOK_SHORT_LINK_HOSTS = frozenset({
+    "vm.tiktok.com", "www.vm.tiktok.com", "vt.tiktok.com", "www.vt.tiktok.com",
+})
+TIKTOK_PAGE_LINK_HOSTS = frozenset({"tiktok.com", "www.tiktok.com", "m.tiktok.com"})
+TIKTOK_MEDIA_HOST_SUFFIXES = (
+    "tiktokcdn.com", "tiktokcdn-us.com", "tiktokcdn-eu.com", "tiktokcdn-in.com",
+    "tiktokv.com", "tiktokv.us", "ibytedtos.com", "byteoversea.com",
+)
 _LOOKUP_CACHE = {}
 _LOOKUP_TASKS = {}
 _RETRY_IN_PROGRESS = set()
+_TIKTOK_DOWNLOAD_PENDING = {}
+_TIKTOK_DOWNLOAD_ACTIVE = set()
+_TIKTOK_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(1)
 _BRIDGLY_LIST_CACHE = OrderedDict()
 _BRIDGLY_LIST_TASKS = {}
 _BRIDGLY_LIST_LOCK = asyncio.Lock()
@@ -1555,14 +1572,344 @@ async def _retry_active_lookup(chat_id, wait_msg, username: str, is_animation: b
     await _show_timeout(wait_msg, chat_id, username, is_animation)
 
 
+class _TikTokVideoDownloadError(Exception):
+    """A safe, user-facing error while extracting or downloading a TikTok video."""
+
+
+def _extract_tiktok_video_url(text):
+    matches = re.findall(r"https?://[^\s<>\"']+", text or "", flags=re.IGNORECASE)
+    if len(matches) != 1:
+        return None
+    candidate = matches[0].rstrip(".,!?)]}»")
+    try:
+        parsed = urlsplit(candidate)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme.lower() not in {"http", "https"}:
+            return None
+        if parsed.username or parsed.password or parsed.port:
+            return None
+    except ValueError:
+        return None
+    path = parsed.path or ""
+    if host in TIKTOK_SHORT_LINK_HOSTS and path.strip("/"):
+        return candidate
+    if host not in TIKTOK_PAGE_LINK_HOSTS:
+        return None
+    if re.search(r"/@[^/]+/video/\d+(?:/|$)", path, re.IGNORECASE):
+        return candidate
+    if re.search(r"/t/[A-Za-z0-9]+/?$", path, re.IGNORECASE):
+        return candidate
+    return None
+
+
+def _tiktok_download_key(message):
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    user_id = getattr(getattr(message, "from_user", None), "id", None)
+    if chat_id is None or user_id is None:
+        return None
+    return (chat_id, user_id)
+
+
+def _pending_tiktok_download_key(message):
+    key = _tiktok_download_key(message)
+    if key is None:
+        return None
+    expires_at = _TIKTOK_DOWNLOAD_PENDING.get(key)
+    if expires_at is None:
+        return None
+    if expires_at <= time.monotonic():
+        _TIKTOK_DOWNLOAD_PENDING.pop(key, None)
+        return None
+    return key
+
+
+def _is_trusted_tiktok_media_url(url):
+    try:
+        parsed = urlsplit(str(url))
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.scheme.lower() != "https" or parsed.username or parsed.password or parsed.port:
+            return False
+    except ValueError:
+        return False
+    return any(host == domain or host.endswith("." + domain) for domain in TIKTOK_MEDIA_HOST_SUFFIXES)
+
+
+def _request_tiktok_video_details(url):
+    if not _extract_tiktok_video_url(url):
+        raise _TikTokVideoDownloadError("أرسل رابط فيديو TikTok صحيحًا.")
+    body = urlencode({"urlInput": url}).encode("utf-8")
+    request = urllib.request.Request(
+        TIKTOK_DOWNLOAD_ENDPOINT,
+        data=body,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Origin": "https://fintok.neocities.org",
+            "Referer": "https://fintok.neocities.org/download/",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TIKTOK_API_TIMEOUT_SECONDS) as response:
+            raw_data = response.read(256_001)
+    except Exception as exc:
+        raise _TikTokVideoDownloadError(
+            "تعذر الاتصال بمصدر تنزيل الفيديو الآن. جرّب الرابط مرة أخرى لاحقًا."
+        ) from exc
+    if len(raw_data) > 256_000:
+        raise _TikTokVideoDownloadError("استجابة مصدر الفيديو غير صالحة.")
+    try:
+        payload = json.loads(raw_data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise _TikTokVideoDownloadError("لم أتمكن من قراءة بيانات الفيديو.") from exc
+    if not isinstance(payload, dict) or payload.get("type") != "video":
+        raise _TikTokVideoDownloadError(
+            "لم أتمكن من العثور على فيديو عام لهذا الرابط. تأكد من صحة الرابط."
+        )
+    media_url = payload.get("video_url")
+    if not isinstance(media_url, str) or not _is_trusted_tiktok_media_url(media_url):
+        raise _TikTokVideoDownloadError("مصدر الفيديو أعاد رابطًا غير صالح.")
+    title = html.unescape(str(payload.get("title") or "")).strip()[:900]
+    return media_url, title
+
+
+class _TikTokMediaRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        if not _is_trusted_tiktok_media_url(new_url):
+            raise _TikTokVideoDownloadError("أوقفنا تحويلًا إلى مصدر فيديو غير موثوق.")
+        return super().redirect_request(
+            request, file_pointer, code, message, headers, new_url
+        )
+
+
+def _download_tiktok_media(media_url):
+    if not _is_trusted_tiktok_media_url(media_url):
+        raise _TikTokVideoDownloadError("رابط ملف الفيديو غير صالح.")
+    request = urllib.request.Request(
+        media_url,
+        headers={
+            "Accept": "video/mp4,video/*,application/octet-stream,*/*",
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.tiktok.com/",
+        },
+    )
+    opener = urllib.request.build_opener(_TikTokMediaRedirectHandler())
+    try:
+        with opener.open(request, timeout=TIKTOK_MEDIA_TIMEOUT_SECONDS) as response:
+            headers = response.headers
+            content_type = (
+                headers.get_content_type() if headers and hasattr(headers, "get_content_type")
+                else str(headers.get("Content-Type", "")).split(";", 1)[0].lower()
+                if headers else ""
+            )
+            if content_type and not content_type.startswith("video/") and content_type != "application/octet-stream":
+                raise _TikTokVideoDownloadError("المصدر لم يُرجع ملف فيديو صالحًا.")
+            content_length = headers.get("Content-Length") if headers else None
+            if content_length and int(content_length) > MAX_TIKTOK_VIDEO_BYTES:
+                raise _TikTokVideoDownloadError(
+                    "حجم الفيديو أكبر من الحد المسموح به لإرساله عبر البوت."
+                )
+            data = bytearray()
+            while True:
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > MAX_TIKTOK_VIDEO_BYTES:
+                    raise _TikTokVideoDownloadError(
+                        "حجم الفيديو أكبر من الحد المسموح به لإرساله عبر البوت."
+                    )
+    except _TikTokVideoDownloadError:
+        raise
+    except Exception as exc:
+        raise _TikTokVideoDownloadError(
+            "تعذر تنزيل ملف الفيديو من المصدر الآن. أعد المحاولة لاحقًا."
+        ) from exc
+    if not data:
+        raise _TikTokVideoDownloadError("ملف الفيديو فارغ أو غير متاح.")
+    if not content_type.startswith("video/") and bytes(data[4:8]) != b"ftyp":
+        raise _TikTokVideoDownloadError("الملف المستلم ليس فيديو MP4 صالحًا.")
+    return bytes(data)
+
+
+def _tiktok_progress_text(phase, frame):
+    width = 12
+    block = 3
+    position = frame % (width - block + 1)
+    bar = "░" * position + "█" * block + "░" * (width - position - block)
+    return f"⏳ {phase}\n[{bar}]"
+
+
+async def _edit_tiktok_progress(chat_id, progress_message, text):
+    if not progress_message:
+        return
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=progress_message.message_id,
+            text=text,
+        )
+    except Exception as exc:
+        print(f"TikTok download progress update failed ({type(exc).__name__}).", flush=True)
+
+
+async def _await_tiktok_thread(chat_id, progress_message, phase, function, *args):
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    frame = 0
+    while not task.done():
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=TIKTOK_PROGRESS_INTERVAL_SECONDS
+            )
+        except asyncio.TimeoutError:
+            frame += 1
+            await _edit_tiktok_progress(
+                chat_id, progress_message, _tiktok_progress_text(phase, frame)
+            )
+        except Exception:
+            break
+    return await task
+
+
+async def _process_tiktok_video_message(message, url):
+    chat_id = message.chat.id
+    key = _tiktok_download_key(message)
+    if key is not None and key in _TIKTOK_DOWNLOAD_ACTIVE:
+        await bot.reply_to(message, "يوجد تنزيل فيديو جارٍ بالفعل؛ انتظر حتى يكتمل.")
+        return
+    if key is not None:
+        _TIKTOK_DOWNLOAD_ACTIVE.add(key)
+    progress_message = None
+    try:
+        progress_message = await bot.send_message(
+            chat_id=chat_id,
+            text=_tiktok_progress_text("جارٍ تجهيز رابط الفيديو...", 0),
+            reply_to_message_id=getattr(message, "message_id", None),
+        )
+        async with _TIKTOK_DOWNLOAD_SEMAPHORE:
+            media_url, title = await _await_tiktok_thread(
+                chat_id,
+                progress_message,
+                "جارٍ استخراج الفيديو من TikTok...",
+                _request_tiktok_video_details,
+                url,
+            )
+            await _edit_tiktok_progress(
+                chat_id,
+                progress_message,
+                _tiktok_progress_text("تم العثور على الفيديو؛ جارٍ تنزيله...", 0),
+            )
+            video_bytes = await _await_tiktok_thread(
+                chat_id,
+                progress_message,
+                "جارٍ تنزيل الفيديو...",
+                _download_tiktok_media,
+                media_url,
+            )
+        video_file = types.InputFile(BytesIO(video_bytes), file_name="tiktok_video.mp4")
+        await bot.send_video(
+            chat_id=chat_id,
+            video=video_file,
+            caption=title or "فيديو TikTok",
+            supports_streaming=True,
+            reply_to_message_id=getattr(message, "message_id", None),
+        )
+        await _edit_tiktok_progress(
+            chat_id, progress_message, "✅ اكتمل التنزيل وأُرسل الفيديو."
+        )
+    except _TikTokVideoDownloadError as exc:
+        if progress_message:
+            await _edit_tiktok_progress(chat_id, progress_message, f"❌ {exc}")
+        else:
+            await bot.reply_to(message, f"❌ {exc}")
+    except Exception as exc:
+        print(f"TikTok video delivery failed ({type(exc).__name__}).", flush=True)
+        if progress_message:
+            await _edit_tiktok_progress(
+                chat_id,
+                progress_message,
+                "❌ تعذر إرسال الفيديو الآن. تأكد أن الرابط عام ثم أعد المحاولة.",
+            )
+        else:
+            await bot.reply_to(
+                message,
+                "❌ تعذر إرسال الفيديو الآن. تأكد أن الرابط عام ثم أعد المحاولة.",
+            )
+    finally:
+        if key is not None:
+            _TIKTOK_DOWNLOAD_ACTIVE.discard(key)
+
+
 @bot.message_handler(commands=["start", "help"])
 async def send_welcome(message):
-    await bot.reply_to(
-        message,
-        "أرسل اسم مستخدم TikTok عام مثل @username أو رابط الملف، "
-        "وسأبحث عن معلومات الحساب وإحصاءاته. استخدم /terms لشروط كشف الدولة، "
-        "و /support للدعم، و /subscription لإدارة اشتراكك.",
+    rich_message = {
+        "blocks": [
+            {
+                "type": "paragraph",
+                "text": (
+                    "أرسل اسم مستخدم TikTok عامًا مثل @username أو رابط الملف، "
+                    "وسأبحث عن معلومات الحساب وإحصاءاته. استخدم /terms لشروط كشف الدولة، "
+                    "و /support للدعم، و /subscription لإدارة اشتراكك."
+                ),
+            },
+            {
+                "type": "paragraph",
+                "text": "📥 لتنزيل فيديوهات TikTok، اضغط الزر أدناه ثم أرسل رابط فيديو TikTok للتحميل.",
+            },
+            {
+                "type": "buttons",
+                "align": "center",
+                "buttons": [
+                    {
+                        "text": "تحميل فيديوهات تيك توك",
+                        "style": "primary",
+                        "callback_data": "video:download",
+                    }
+                ],
+            },
+        ],
+        "is_rtl": True,
+    }
+    params = {
+        "chat_id": message.chat.id,
+        "rich_message": json.dumps(rich_message, ensure_ascii=False),
+    }
+    message_id = getattr(message, "message_id", None)
+    if message_id is not None:
+        params["reply_parameters"] = json.dumps({"message_id": message_id})
+    await asyncio.to_thread(
+        apihelper._make_request,
+        BOT_TOKEN,
+        "sendRichMessage",
+        method="post",
+        params=params,
     )
+
+
+@bot.callback_query_handler(func=lambda call: (call.data or "") == "video:download")
+async def request_tiktok_video_link(call):
+    await bot.answer_callback_query(call.id)
+    message = call.message
+    chat_id = message.chat.id
+    prompt = await bot.send_message(
+        chat_id=chat_id,
+        text="أرسل رابط فيديو TikTok العام للتحميل الآن. مثال:\nhttps://vm.tiktok.com/…",
+        reply_markup=types.ForceReply(
+            selective=True,
+            input_field_placeholder="رابط فيديو TikTok",
+        ),
+        reply_to_message_id=message.message_id,
+    )
+    user_id = getattr(getattr(call, "from_user", None), "id", None)
+    key = (chat_id, user_id) if user_id is not None else None
+    if key is not None:
+        _TIKTOK_DOWNLOAD_PENDING[key] = time.monotonic() + TIKTOK_DOWNLOAD_PENDING_TTL_SECONDS
 
 
 @bot.message_handler(commands=["terms"])
@@ -2016,6 +2363,20 @@ async def handle_username_message(message):
                 message,
                 f"أرسل عددًا صحيحًا من 1 إلى {_MAX_COUNTRY_STARS_PRICE} نجمة.",
             )
+        return
+
+    pending_video_key = _pending_tiktok_download_key(message)
+    video_url = _extract_tiktok_video_url(raw_text)
+    if video_url:
+        if pending_video_key is not None:
+            _TIKTOK_DOWNLOAD_PENDING.pop(pending_video_key, None)
+        await _process_tiktok_video_message(message, video_url)
+        return
+    if pending_video_key is not None:
+        await bot.reply_to(
+            message,
+            "أرسل رابط فيديو TikTok صالحًا مثل https://vm.tiktok.com/…",
+        )
         return
 
     username = normalize_username(raw_text)
